@@ -30,8 +30,7 @@ struct PendingFrame {
 }
 
 /// Options controlling VMAF score post-processing.
-#[derive(Clone, Copy, Debug)]
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct VmafOptions {
     /// Apply the model's `score_transform` block (polynomial/knots/rectify).
     ///
@@ -41,7 +40,6 @@ pub struct VmafOptions {
     pub apply_score_transform: bool,
 }
 
-
 /// VMAF scoring context for a single video sequence.
 pub struct VmafContext {
     model: VmafModel,
@@ -49,6 +47,8 @@ pub struct VmafContext {
     adm: AdmExtractor,
     motion: MotionExtractor,
     width: usize,
+    height: usize,
+    bpc: u8,
     pending: Vec<PendingFrame>,
     per_frame_scores: Vec<FrameScore>,
     frame_count: usize,
@@ -73,6 +73,8 @@ impl VmafContext {
             motion: MotionExtractor::new(width, height, bpc),
             model,
             width,
+            height,
+            bpc,
             pending: Vec::new(),
             per_frame_scores: Vec::new(),
             frame_count: 0,
@@ -95,6 +97,40 @@ impl VmafContext {
         self.frame_count += 1;
 
         motion_result.and_then(|(idx, m2)| self.finalize_frame(idx, m2 as f64))
+    }
+
+    /// Push a batch of reference/distorted frame pairs in parallel.
+    /// Returns a list of `FrameScore`s that have become available.
+    pub fn push_frame_batch(&mut self, frames: &[(&[u16], &[u16])]) -> Vec<FrameScore> {
+        use rayon::prelude::*;
+
+        let extracted: Vec<_> = frames
+            .par_iter()
+            .map(|(r, d)| {
+                let vif_scores = self.vif.compute_frame(r, d);
+                let adm_score = self.adm.compute_frame(r, d);
+                let blur =
+                    vmaf_motion::blur_frame(r, self.width, self.width, self.height, self.bpc);
+                (vif_scores, adm_score, blur)
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for (vif_scores, adm_score, blur) in extracted {
+            self.pending.push(PendingFrame {
+                frame_idx: self.frame_count,
+                adm: adm_score,
+                vif: vif_scores.scale,
+            });
+            self.frame_count += 1;
+
+            if let Some((idx, m2)) = self.motion.push_blurred_frame(blur) {
+                if let Some(fs) = self.finalize_frame(idx, m2 as f64) {
+                    out.push(fs);
+                }
+            }
+        }
+        out
     }
 
     /// Flush the final pending frame. Call once after all frames are pushed.

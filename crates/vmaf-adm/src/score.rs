@@ -3,6 +3,8 @@
 //! This module matches the fixed-point CSF/CM logic and the shifted cube accumulators
 //! from libvmaf `integer_adm.c`.
 
+#![allow(clippy::too_many_arguments, clippy::type_complexity)]
+
 use crate::noise_floor;
 
 const ADM_BORDER_FACTOR: f64 = 0.1;

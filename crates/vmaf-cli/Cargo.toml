@@ -11,3 +11,4 @@ path = "src/main.rs"
 vmaf  = { workspace = true }
 clap  = { workspace = true }
 y4m   = { workspace = true }
+rayon = { workspace = true }

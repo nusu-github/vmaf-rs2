@@ -4,6 +4,7 @@
 //! Maintains a 3-slot ring buffer of Gaussian-blurred frames.
 //! Requires `flush()` after the final frame to emit the pending motion2 score (§4.4.2).
 
+pub use blur::blur_frame;
 mod blur;
 mod sad;
 

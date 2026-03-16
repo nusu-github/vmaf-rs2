@@ -3,6 +3,8 @@
 //! Outputs 4 per-scale scores (`vif_scale{0..3}`) and one combined score.
 //! All transcendental math is handled via a precomputed Q11 log2 LUT (§4.2.1).
 
+#![allow(clippy::needless_range_loop)]
+
 mod extractor;
 mod filter;
 mod math;

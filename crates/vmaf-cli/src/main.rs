@@ -21,6 +21,9 @@ struct Args {
     /// Frame subsampling factor (1 = all frames)
     #[arg(long, default_value_t = 1)]
     n_subsample: usize,
+    /// Number of threads to use (0 = auto)
+    #[arg(long, default_value_t = 0)]
+    threads: usize,
     /// Apply the model's score_transform (spec mode). Disabled by default to match
     /// the reference ./vmaf behavior for bundled v0.6.x models.
     #[arg(long, default_value_t = false)]
@@ -68,6 +71,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     eprintln!("[vmaf] {}×{} bpc={} model loaded", width, height, bpc);
 
+    if args.threads > 0 {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(args.threads)
+            .build_global()
+            .unwrap();
+    }
+
     let mut ctx = VmafContext::new_with_options(
         model,
         width,
@@ -78,6 +88,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     );
     let mut frame_count = 0usize;
+    let batch_size = if args.threads > 0 {
+        args.threads * 2
+    } else {
+        rayon::current_num_threads() * 2
+    };
+    let mut batch = Vec::with_capacity(batch_size);
 
     loop {
         let ref_frame = match ref_dec.read_frame() {
@@ -94,7 +110,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let ref_luma = luma_to_u16(ref_frame.get_y_plane(), bpc);
         let dis_luma = luma_to_u16(dis_frame.get_y_plane(), bpc);
 
-        if let Some(fs) = ctx.push_frame(&ref_luma, &dis_luma) {
+        batch.push((ref_luma, dis_luma));
+
+        if batch.len() >= batch_size {
+            let refs: Vec<(&[u16], &[u16])> = batch
+                .iter()
+                .map(|(r, d)| (r.as_slice(), d.as_slice()))
+                .collect();
+            for fs in ctx.push_frame_batch(&refs) {
+                eprintln!(
+                    "[vmaf] frame {:3}  score={:.4}  adm2={:.4}  motion2={:.4}  \
+                     vif=[{:.4},{:.4},{:.4},{:.4}]",
+                    fs.frame_index,
+                    fs.score,
+                    fs.adm2,
+                    fs.motion2,
+                    fs.vif_scale0,
+                    fs.vif_scale1,
+                    fs.vif_scale2,
+                    fs.vif_scale3,
+                );
+            }
+            frame_count += batch.len();
+            eprintln!("[vmaf] pushed {} frames…", frame_count);
+            batch.clear();
+        }
+    }
+
+    if !batch.is_empty() {
+        let refs: Vec<(&[u16], &[u16])> = batch
+            .iter()
+            .map(|(r, d)| (r.as_slice(), d.as_slice()))
+            .collect();
+        for fs in ctx.push_frame_batch(&refs) {
             eprintln!(
                 "[vmaf] frame {:3}  score={:.4}  adm2={:.4}  motion2={:.4}  \
                  vif=[{:.4},{:.4},{:.4},{:.4}]",
@@ -108,10 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 fs.vif_scale3,
             );
         }
-        frame_count += 1;
-        if frame_count.is_multiple_of(10) {
-            eprintln!("[vmaf] pushed {} frames…", frame_count);
-        }
+        frame_count += batch.len();
     }
 
     eprintln!("[vmaf] pushed {} frames total, flushing…", frame_count);

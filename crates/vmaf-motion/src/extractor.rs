@@ -47,12 +47,21 @@ impl MotionExtractor {
     /// Returns `Some((frame_index, motion2_score))` when a score becomes
     /// available, or `None` if more frames are needed.
     pub fn push_frame(&mut self, luma: &[u16], stride: usize) -> Option<(usize, f32)> {
+        let blurred = blur_frame(luma, stride, self.width, self.height, self.bpc);
+        self.push_blurred_frame(blurred)
+    }
+
+    /// Push a pre-computed blurred reference frame.
+    ///
+    /// This bypasses the internal blur calculation, allowing the blur to be
+    /// computed in parallel across multiple frames before sequential state update.
+    pub fn push_blurred_frame(&mut self, blurred_luma: Vec<u16>) -> Option<(usize, f32)> {
         let n = self.frame_count;
         let w = self.width;
         let h = self.height;
 
-        // Blur this frame into slot n % 3.
-        self.slots[n % 3] = blur_frame(luma, stride, w, h, self.bpc);
+        // Store this pre-blurred frame into slot n % 3.
+        self.slots[n % 3] = blurred_luma;
 
         let motion1_n = if n == 0 {
             0.0_f32

@@ -22,13 +22,7 @@ fn reflect(i: i32, len: i32) -> usize {
 /// - `bpc`: bits per component (8, 10, or 12)
 ///
 /// Output layout: `blurred[row * width + col]` (stride = width).
-pub(crate) fn blur_frame(
-    src: &[u16],
-    stride: usize,
-    width: usize,
-    height: usize,
-    bpc: u8,
-) -> Vec<u16> {
+pub fn blur_frame(src: &[u16], stride: usize, width: usize, height: usize, bpc: u8) -> Vec<u16> {
     let n = width * height;
     let mut tmp = vec![0u16; n];
     let mut out = vec![0u16; n];
@@ -40,9 +34,9 @@ pub(crate) fn blur_frame(
     for i in 0..height {
         for j in 0..width {
             let mut accum = 0u32;
-            for k in 0..5usize {
+            for (k, &filter_val) in MOTION_FILTER.iter().enumerate() {
                 let ii = reflect(i as i32 - 2 + k as i32, height as i32);
-                accum = accum.wrapping_add(MOTION_FILTER[k] * src[ii * stride + j] as u32);
+                accum = accum.wrapping_add(filter_val * src[ii * stride + j] as u32);
             }
             tmp[i * width + j] = ((accum + round_v) >> shift_v) as u16;
         }
@@ -52,9 +46,9 @@ pub(crate) fn blur_frame(
     for i in 0..height {
         for j in 0..width {
             let mut accum = 0u32;
-            for k in 0..5usize {
+            for (k, &filter_val) in MOTION_FILTER.iter().enumerate() {
                 let jj = reflect(j as i32 - 2 + k as i32, width as i32);
-                accum = accum.wrapping_add(MOTION_FILTER[k] * tmp[i * width + jj] as u32);
+                accum = accum.wrapping_add(filter_val * tmp[i * width + jj] as u32);
             }
             out[i * width + j] = ((accum + 32768) >> 16) as u16;
         }
