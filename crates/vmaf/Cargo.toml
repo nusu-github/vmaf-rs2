@@ -1,0 +1,12 @@
+[package]
+name    = "vmaf"
+version = "0.1.0"
+edition = "2021"
+
+# §2 Pipeline orchestration: VmafContext + FeatureCollector
+[dependencies]
+vmaf-vif    = { workspace = true }
+vmaf-adm    = { workspace = true }
+vmaf-motion = { workspace = true }
+vmaf-model  = { workspace = true }
+rayon       = { workspace = true }

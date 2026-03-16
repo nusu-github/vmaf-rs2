@@ -1,0 +1,13 @@
+[package]
+name    = "vmaf-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "vmaf"
+path = "src/main.rs"
+
+[dependencies]
+vmaf  = { workspace = true }
+clap  = { workspace = true }
+y4m   = { workspace = true }

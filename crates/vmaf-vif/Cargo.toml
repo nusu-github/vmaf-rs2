@@ -1,0 +1,7 @@
+[package]
+name    = "vmaf-vif"
+version = "0.1.0"
+edition = "2021"
+
+# §4.2 Integer VIF — no external math deps (LUT-only)
+[dependencies]
