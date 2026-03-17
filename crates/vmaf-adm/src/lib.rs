@@ -21,6 +21,9 @@ mod tests {
     use super::dwt::{dwt_s123, dwt_scale0, get_best15_from32};
     use super::extractor::AdmExtractor;
     use super::math::reflect_index;
+    use super::score::{
+        score_scale0, score_scale0_reference, score_scale_s123, score_scale_s123_reference,
+    };
     use super::simd;
     use super::tables::DIV_LOOKUP;
     use vmaf_cpu::SimdBackend;
@@ -168,6 +171,121 @@ mod tests {
             let scalar = dwt_s123(&ll, width, height, scale);
             let simd = simd::dwt_s123(SimdBackend::X86Avx2Fma, &ll, width, height, scale);
             assert_eq!(simd, scalar, "scale {scale} mismatch");
+        }
+    }
+
+    #[test]
+    fn score_scale0_matches_reference_pipeline() {
+        let width = 27;
+        let height = 19;
+        let bpc = 10;
+        let limit = 100.0;
+        let max_value = (1u16 << bpc) - 1;
+
+        let ref_plane = plane_pattern(width, height, max_value);
+        let mut dis_plane = plane_pattern(width, height, max_value);
+        for (idx, value) in dis_plane.iter_mut().enumerate() {
+            let delta = ((idx * 11 + 5) % 23) as u16;
+            *value = value.saturating_sub(delta / 2).min(max_value);
+        }
+
+        let ref0 = dwt_scale0(&ref_plane, width, height, bpc);
+        let dis0 = dwt_scale0(&dis_plane, width, height, bpc);
+
+        let actual = score_scale0(
+            &ref0.h,
+            &ref0.v,
+            &ref0.d,
+            &dis0.h,
+            &dis0.v,
+            &dis0.d,
+            limit,
+            ref0.width,
+            ref0.height,
+        );
+        let expected = score_scale0_reference(
+            &ref0.h,
+            &ref0.v,
+            &ref0.d,
+            &dis0.h,
+            &dis0.v,
+            &dis0.d,
+            limit,
+            ref0.width,
+            ref0.height,
+        );
+
+        assert_eq!(actual.0.to_bits(), expected.0.to_bits());
+        assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+    }
+
+    #[test]
+    fn score_scale_s123_matches_reference_pipeline() {
+        let width = 27;
+        let height = 19;
+        let bpc = 10;
+        let limit = 100.0;
+        let max_value = (1u16 << bpc) - 1;
+
+        let ref_plane = plane_pattern(width, height, max_value);
+        let mut dis_plane = plane_pattern(width, height, max_value);
+        for (idx, value) in dis_plane.iter_mut().enumerate() {
+            let delta = ((idx * 13 + 9) % 29) as u16;
+            *value = value.saturating_sub(delta / 2).min(max_value);
+        }
+
+        let ref0 = dwt_scale0(&ref_plane, width, height, bpc);
+        let dis0 = dwt_scale0(&dis_plane, width, height, bpc);
+
+        let mut cur_ref_ll: Vec<i32> = ref0.a.iter().map(|&x| x as i32).collect();
+        let mut cur_dis_ll: Vec<i32> = dis0.a.iter().map(|&x| x as i32).collect();
+        let mut cur_w = ref0.width;
+        let mut cur_h = ref0.height;
+
+        for scale in 1..=3usize {
+            let ref_s = dwt_s123(&cur_ref_ll, cur_w, cur_h, scale);
+            let dis_s = dwt_s123(&cur_dis_ll, cur_w, cur_h, scale);
+
+            let actual = score_scale_s123(
+                &ref_s.h,
+                &ref_s.v,
+                &ref_s.d,
+                &dis_s.h,
+                &dis_s.v,
+                &dis_s.d,
+                limit,
+                scale,
+                ref_s.width,
+                ref_s.height,
+            );
+            let expected = score_scale_s123_reference(
+                &ref_s.h,
+                &ref_s.v,
+                &ref_s.d,
+                &dis_s.h,
+                &dis_s.v,
+                &dis_s.d,
+                limit,
+                scale,
+                ref_s.width,
+                ref_s.height,
+            );
+
+            assert_eq!(
+                actual.0.to_bits(),
+                expected.0.to_bits(),
+                "num mismatch at scale {scale}"
+            );
+            assert_eq!(
+                actual.1.to_bits(),
+                expected.1.to_bits(),
+                "den mismatch at scale {scale}"
+            );
+
+            cur_ref_ll = ref_s.a;
+            cur_dis_ll = dis_s.a;
+            cur_w = ref_s.width;
+            cur_h = ref_s.height;
         }
     }
 

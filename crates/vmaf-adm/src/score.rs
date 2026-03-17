@@ -5,12 +5,23 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+use crate::decouple::{decouple_s123, decouple_scale0};
 use crate::noise_floor;
 
 const ADM_BORDER_FACTOR: f64 = 0.1;
 
 const ONE_BY_15: i32 = 8738;
 const I4_ONE_BY_15: i64 = 286_331_153;
+const SCALE0_CSF_RFACTOR: [i32; 3] = [36453, 36453, 49417];
+const SCALE0_CSF_SHIFTS: [u32; 3] = [15, 15, 17];
+const SCALE0_CSF_SHIFT_ADDS: [i32; 3] = [16384, 16384, 65535];
+const SCALE0_FIX_ONE_BY_30: i32 = 4369;
+const SCALE0_FIX_ONE_BY_30_ADD: i32 = 2048;
+const S123_FIX_ONE_BY_30: i64 = 143_165_577;
+const S123_SHIFT_DST: u32 = 28;
+const S123_SHIFT_FLT: u32 = 32;
+const S123_ADD_BEFORE_SHIFT_DST: i64 = 1i64 << (S123_SHIFT_DST - 1);
+const S123_ADD_BEFORE_SHIFT_FLT: i64 = 1i64 << (S123_SHIFT_FLT - 1);
 
 #[inline]
 fn ceil_log2_u32(n: u32) -> u32 {
@@ -34,107 +45,325 @@ pub(crate) fn accum_border(w: usize, h: usize) -> (usize, usize, usize, usize) {
     (left, top, right, bottom)
 }
 
-fn csf_scale0(
-    art_h: &[i16],
-    art_v: &[i16],
-    art_d: &[i16],
-) -> (Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>) {
-    // Default-viewing-distance fixed-point factors from libvmaf.
-    let i_rfactor: [i32; 3] = [36453, 36453, 49417];
-    let i_shifts: [i32; 3] = [15, 15, 17];
-    let i_shiftsadd: [i32; 3] = [16384, 16384, 65535];
-    let fix_one_by_30: i32 = 4369; // (1/30) * 2^17
-
-    let n = art_h.len();
-    debug_assert_eq!(art_v.len(), n);
-    debug_assert_eq!(art_d.len(), n);
-
-    let mut csf_a_h = vec![0i16; n];
-    let mut csf_a_v = vec![0i16; n];
-    let mut csf_a_d = vec![0i16; n];
-    let mut csf_f_h = vec![0i16; n];
-    let mut csf_f_v = vec![0i16; n];
-    let mut csf_f_d = vec![0i16; n];
-
-    for k in 0..n {
-        let srcs = [art_h[k] as i32, art_v[k] as i32, art_d[k] as i32];
-        let mut dsts = [0i16; 3];
-        let mut flts = [0i16; 3];
-        for theta in 0..3 {
-            let dst_val = i_rfactor[theta] * srcs[theta];
-            let i16_dst = ((dst_val + i_shiftsadd[theta]) >> i_shifts[theta]) as i16;
-            dsts[theta] = i16_dst;
-            let flt = (((fix_one_by_30 * (i16_dst as i32).abs()) + 2048) >> 12) as i16;
-            flts[theta] = flt;
-        }
-        csf_a_h[k] = dsts[0];
-        csf_a_v[k] = dsts[1];
-        csf_a_d[k] = dsts[2];
-        csf_f_h[k] = flts[0];
-        csf_f_v[k] = flts[1];
-        csf_f_d[k] = flts[2];
-    }
-
-    (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d)
+#[inline]
+fn row<T>(plane: &[T], width: usize, row: usize) -> &[T] {
+    let start = row * width;
+    &plane[start..start + width]
 }
 
-fn csf_s123(
-    art_h: &[i32],
-    art_v: &[i32],
-    art_d: &[i32],
-    scale: usize,
-    rfactor: [f32; 3],
-) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
-    let n = art_h.len();
-    debug_assert_eq!(art_v.len(), n);
-    debug_assert_eq!(art_d.len(), n);
-
-    // Fixed-point rfactor (Q32) as in libvmaf.
+#[inline]
+fn scale123_rfactor_fp(rfactor: [f32; 3]) -> [u32; 3] {
     let pow2_32 = 4294967296.0f64;
-    let i_rfactor: [u32; 3] = [
+    [
         (rfactor[0] as f64 * pow2_32) as u32,
         (rfactor[1] as f64 * pow2_32) as u32,
         (rfactor[2] as f64 * pow2_32) as u32,
-    ];
+    ]
+}
 
-    const FIX_ONE_BY_30: i64 = 143_165_577;
-    const SHIFT_DST: u32 = 28;
-    const SHIFT_FLT: u32 = 32;
+#[inline]
+fn csf_scale0_triplet(art_h: i16, art_v: i16, art_d: i16) -> ([i16; 3], [i16; 3]) {
+    let srcs = [art_h as i32, art_v as i32, art_d as i32];
+    let mut dsts = [0i16; 3];
+    let mut flts = [0i16; 3];
 
-    let add_bef_shift_dst: i64 = 1i64 << (SHIFT_DST - 1);
-    let add_bef_shift_flt: i64 = 1i64 << (SHIFT_FLT - 1);
-
-    let mut csf_a_h = vec![0i32; n];
-    let mut csf_a_v = vec![0i32; n];
-    let mut csf_a_d = vec![0i32; n];
-    let mut csf_f_h = vec![0i32; n];
-    let mut csf_f_v = vec![0i32; n];
-    let mut csf_f_d = vec![0i32; n];
-
-    // `scale` is 1..=3; arrays in libvmaf index by (scale-1).
-    let _ = scale; // same SHIFT_* for all scales.
-
-    for k in 0..n {
-        let srcs = [art_h[k] as i64, art_v[k] as i64, art_d[k] as i64];
-        let mut dsts = [0i32; 3];
-        let mut flts = [0i32; 3];
-        for theta in 0..3 {
-            let dst_val =
-                (((i_rfactor[theta] as i64) * srcs[theta]) + add_bef_shift_dst) >> SHIFT_DST;
-            dsts[theta] = dst_val as i32;
-            let flt = (((FIX_ONE_BY_30 * (dst_val as i32).abs() as i64) + add_bef_shift_flt)
-                >> SHIFT_FLT) as i32;
-            flts[theta] = flt;
-        }
-        csf_a_h[k] = dsts[0];
-        csf_a_v[k] = dsts[1];
-        csf_a_d[k] = dsts[2];
-        csf_f_h[k] = flts[0];
-        csf_f_v[k] = flts[1];
-        csf_f_d[k] = flts[2];
+    for theta in 0..3 {
+        let dst_val = SCALE0_CSF_RFACTOR[theta] * srcs[theta];
+        let dst = ((dst_val + SCALE0_CSF_SHIFT_ADDS[theta]) >> SCALE0_CSF_SHIFTS[theta]) as i16;
+        dsts[theta] = dst;
+        flts[theta] =
+            (((SCALE0_FIX_ONE_BY_30 * (dst as i32).abs()) + SCALE0_FIX_ONE_BY_30_ADD) >> 12) as i16;
     }
 
-    (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d)
+    (dsts, flts)
+}
+
+#[inline]
+fn csf_s123_triplet(
+    art_h: i32,
+    art_v: i32,
+    art_d: i32,
+    i_rfactor: [u32; 3],
+) -> ([i32; 3], [i32; 3]) {
+    let srcs = [art_h as i64, art_v as i64, art_d as i64];
+    let mut dsts = [0i32; 3];
+    let mut flts = [0i32; 3];
+
+    for theta in 0..3 {
+        let dst_val = (((i_rfactor[theta] as i64) * srcs[theta]) + S123_ADD_BEFORE_SHIFT_DST)
+            >> S123_SHIFT_DST;
+        let dst = dst_val as i32;
+        dsts[theta] = dst;
+        flts[theta] = (((S123_FIX_ONE_BY_30 * (dst as i64).abs()) + S123_ADD_BEFORE_SHIFT_FLT)
+            >> S123_SHIFT_FLT) as i32;
+    }
+
+    (dsts, flts)
+}
+
+struct AdmCmScale0Row {
+    scaled_h: Vec<i32>,
+    scaled_v: Vec<i32>,
+    scaled_d: Vec<i32>,
+    csf_a_h: Vec<i16>,
+    csf_a_v: Vec<i16>,
+    csf_a_d: Vec<i16>,
+    csf_f_h: Vec<i16>,
+    csf_f_v: Vec<i16>,
+    csf_f_d: Vec<i16>,
+}
+
+impl AdmCmScale0Row {
+    fn with_capacity(width: usize) -> Self {
+        Self {
+            scaled_h: Vec::with_capacity(width),
+            scaled_v: Vec::with_capacity(width),
+            scaled_d: Vec::with_capacity(width),
+            csf_a_h: Vec::with_capacity(width),
+            csf_a_v: Vec::with_capacity(width),
+            csf_a_d: Vec::with_capacity(width),
+            csf_f_h: Vec::with_capacity(width),
+            csf_f_v: Vec::with_capacity(width),
+            csf_f_d: Vec::with_capacity(width),
+        }
+    }
+
+    fn refill(
+        &mut self,
+        ref_h: &[i16],
+        ref_v: &[i16],
+        ref_d: &[i16],
+        dis_h: &[i16],
+        dis_v: &[i16],
+        dis_d: &[i16],
+        adm_enhn_gain_limit: f64,
+    ) {
+        let width = ref_h.len();
+        debug_assert_eq!(ref_v.len(), width);
+        debug_assert_eq!(ref_d.len(), width);
+        debug_assert_eq!(dis_h.len(), width);
+        debug_assert_eq!(dis_v.len(), width);
+        debug_assert_eq!(dis_d.len(), width);
+
+        self.scaled_h.clear();
+        self.scaled_v.clear();
+        self.scaled_d.clear();
+        self.csf_a_h.clear();
+        self.csf_a_v.clear();
+        self.csf_a_d.clear();
+        self.csf_f_h.clear();
+        self.csf_f_v.clear();
+        self.csf_f_d.clear();
+
+        for k in 0..width {
+            let (rst_h, rst_v, rst_d, art_h, art_v, art_d) = decouple_scale0(
+                ref_h[k],
+                ref_v[k],
+                ref_d[k],
+                dis_h[k],
+                dis_v[k],
+                dis_d[k],
+                adm_enhn_gain_limit,
+            );
+            let (csf_a, csf_f) = csf_scale0_triplet(art_h, art_v, art_d);
+
+            self.scaled_h.push(rst_h as i32 * SCALE0_CSF_RFACTOR[0]);
+            self.scaled_v.push(rst_v as i32 * SCALE0_CSF_RFACTOR[1]);
+            self.scaled_d.push(rst_d as i32 * SCALE0_CSF_RFACTOR[2]);
+            self.csf_a_h.push(csf_a[0]);
+            self.csf_a_v.push(csf_a[1]);
+            self.csf_a_d.push(csf_a[2]);
+            self.csf_f_h.push(csf_f[0]);
+            self.csf_f_v.push(csf_f[1]);
+            self.csf_f_d.push(csf_f[2]);
+        }
+    }
+}
+
+struct AdmCmScale123Row {
+    scaled_h: Vec<i32>,
+    scaled_v: Vec<i32>,
+    scaled_d: Vec<i32>,
+    csf_a_h: Vec<i32>,
+    csf_a_v: Vec<i32>,
+    csf_a_d: Vec<i32>,
+    csf_f_h: Vec<i32>,
+    csf_f_v: Vec<i32>,
+    csf_f_d: Vec<i32>,
+}
+
+impl AdmCmScale123Row {
+    fn with_capacity(width: usize) -> Self {
+        Self {
+            scaled_h: Vec::with_capacity(width),
+            scaled_v: Vec::with_capacity(width),
+            scaled_d: Vec::with_capacity(width),
+            csf_a_h: Vec::with_capacity(width),
+            csf_a_v: Vec::with_capacity(width),
+            csf_a_d: Vec::with_capacity(width),
+            csf_f_h: Vec::with_capacity(width),
+            csf_f_v: Vec::with_capacity(width),
+            csf_f_d: Vec::with_capacity(width),
+        }
+    }
+
+    fn refill(
+        &mut self,
+        ref_h: &[i32],
+        ref_v: &[i32],
+        ref_d: &[i32],
+        dis_h: &[i32],
+        dis_v: &[i32],
+        dis_d: &[i32],
+        adm_enhn_gain_limit: f64,
+        i_rfactor: [u32; 3],
+    ) {
+        let width = ref_h.len();
+        debug_assert_eq!(ref_v.len(), width);
+        debug_assert_eq!(ref_d.len(), width);
+        debug_assert_eq!(dis_h.len(), width);
+        debug_assert_eq!(dis_v.len(), width);
+        debug_assert_eq!(dis_d.len(), width);
+
+        self.scaled_h.clear();
+        self.scaled_v.clear();
+        self.scaled_d.clear();
+        self.csf_a_h.clear();
+        self.csf_a_v.clear();
+        self.csf_a_d.clear();
+        self.csf_f_h.clear();
+        self.csf_f_v.clear();
+        self.csf_f_d.clear();
+
+        for k in 0..width {
+            let (rst_h, rst_v, rst_d, art_h, art_v, art_d) = decouple_s123(
+                ref_h[k],
+                ref_v[k],
+                ref_d[k],
+                dis_h[k],
+                dis_v[k],
+                dis_d[k],
+                adm_enhn_gain_limit,
+            );
+            let (csf_a, csf_f) = csf_s123_triplet(art_h, art_v, art_d, i_rfactor);
+
+            self.scaled_h.push(
+                (((rst_h as i64) * (i_rfactor[0] as i64) + S123_ADD_BEFORE_SHIFT_DST)
+                    >> S123_SHIFT_DST) as i32,
+            );
+            self.scaled_v.push(
+                (((rst_v as i64) * (i_rfactor[1] as i64) + S123_ADD_BEFORE_SHIFT_DST)
+                    >> S123_SHIFT_DST) as i32,
+            );
+            self.scaled_d.push(
+                (((rst_d as i64) * (i_rfactor[2] as i64) + S123_ADD_BEFORE_SHIFT_DST)
+                    >> S123_SHIFT_DST) as i32,
+            );
+            self.csf_a_h.push(csf_a[0]);
+            self.csf_a_v.push(csf_a[1]);
+            self.csf_a_d.push(csf_a[2]);
+            self.csf_f_h.push(csf_f[0]);
+            self.csf_f_v.push(csf_f[1]);
+            self.csf_f_d.push(csf_f[2]);
+        }
+    }
+}
+
+#[inline]
+fn threshold_scale0_component(
+    prev: &[i16],
+    cur: &[i16],
+    next: &[i16],
+    center: i16,
+    j: usize,
+) -> i32 {
+    let center = ((ONE_BY_15 * (center as i32).abs()) + SCALE0_FIX_ONE_BY_30_ADD) >> 12;
+    prev[j - 1] as i32
+        + prev[j] as i32
+        + prev[j + 1] as i32
+        + cur[j - 1] as i32
+        + center
+        + cur[j + 1] as i32
+        + next[j - 1] as i32
+        + next[j] as i32
+        + next[j + 1] as i32
+}
+
+#[inline]
+fn threshold_scale0(
+    prev: &AdmCmScale0Row,
+    cur: &AdmCmScale0Row,
+    next: &AdmCmScale0Row,
+    j: usize,
+) -> i32 {
+    threshold_scale0_component(
+        &prev.csf_f_h,
+        &cur.csf_f_h,
+        &next.csf_f_h,
+        cur.csf_a_h[j],
+        j,
+    ) + threshold_scale0_component(
+        &prev.csf_f_v,
+        &cur.csf_f_v,
+        &next.csf_f_v,
+        cur.csf_a_v[j],
+        j,
+    ) + threshold_scale0_component(
+        &prev.csf_f_d,
+        &cur.csf_f_d,
+        &next.csf_f_d,
+        cur.csf_a_d[j],
+        j,
+    )
+}
+
+#[inline]
+fn threshold_scale123_component(
+    prev: &[i32],
+    cur: &[i32],
+    next: &[i32],
+    center: i32,
+    j: usize,
+) -> i32 {
+    let center = (((I4_ONE_BY_15 * (center as i64).abs()) + S123_ADD_BEFORE_SHIFT_FLT)
+        >> S123_SHIFT_FLT) as i32;
+    prev[j - 1]
+        + prev[j]
+        + prev[j + 1]
+        + cur[j - 1]
+        + center
+        + cur[j + 1]
+        + next[j - 1]
+        + next[j]
+        + next[j + 1]
+}
+
+#[inline]
+fn threshold_scale123(
+    prev: &AdmCmScale123Row,
+    cur: &AdmCmScale123Row,
+    next: &AdmCmScale123Row,
+    j: usize,
+) -> i32 {
+    threshold_scale123_component(
+        &prev.csf_f_h,
+        &cur.csf_f_h,
+        &next.csf_f_h,
+        cur.csf_a_h[j],
+        j,
+    ) + threshold_scale123_component(
+        &prev.csf_f_v,
+        &cur.csf_f_v,
+        &next.csf_f_v,
+        cur.csf_a_v[j],
+        j,
+    ) + threshold_scale123_component(
+        &prev.csf_f_d,
+        &cur.csf_f_d,
+        &next.csf_f_d,
+        cur.csf_a_d[j],
+        j,
+    )
 }
 
 fn adm_csf_den_scale0(
@@ -275,6 +504,401 @@ fn adm_csf_den_s123(
 }
 
 fn adm_cm_scale0(
+    ref_h: &[i16],
+    ref_v: &[i16],
+    ref_d: &[i16],
+    dis_h: &[i16],
+    dis_v: &[i16],
+    dis_d: &[i16],
+    w: usize,
+    h: usize,
+    adm_enhn_gain_limit: f64,
+) -> f32 {
+    let n = w * h;
+    debug_assert_eq!(ref_h.len(), n);
+    debug_assert_eq!(ref_v.len(), n);
+    debug_assert_eq!(ref_d.len(), n);
+    debug_assert_eq!(dis_h.len(), n);
+    debug_assert_eq!(dis_v.len(), n);
+    debug_assert_eq!(dis_d.len(), n);
+
+    let (left, top, right, bottom) = accum_border(w, h);
+    let start_col = left.max(1);
+    let end_col = right.min(w.saturating_sub(1));
+    let start_row = top.max(1);
+    let end_row = bottom.min(h.saturating_sub(1));
+
+    let shift_xhsq: i32 = 29;
+    let shift_xvsq: i32 = 29;
+    let shift_xdsq: i32 = 30;
+    let add_shift_xhsq: i64 = 268_435_456;
+    let add_shift_xvsq: i64 = 268_435_456;
+    let add_shift_xdsq: i64 = 536_870_912;
+
+    let shift_xhcub = ceil_log2_u32(w as u32).saturating_sub(4);
+    let shift_xvcub = ceil_log2_u32(w as u32).saturating_sub(4);
+    let shift_xdcub = ceil_log2_u32(w as u32).saturating_sub(3);
+    let add_shift_xhcub = if shift_xhcub > 0 {
+        1i64 << (shift_xhcub - 1)
+    } else {
+        0
+    };
+    let add_shift_xvcub = if shift_xvcub > 0 {
+        1i64 << (shift_xvcub - 1)
+    } else {
+        0
+    };
+    let add_shift_xdcub = if shift_xdcub > 0 {
+        1i64 << (shift_xdcub - 1)
+    } else {
+        0
+    };
+
+    let shift_inner_accum = ceil_log2_u32(h as u32);
+    let add_shift_inner_accum = if shift_inner_accum > 0 {
+        1i64 << (shift_inner_accum - 1)
+    } else {
+        0
+    };
+
+    let shift_xhsub: i32 = 10;
+    let shift_xvsub: i32 = 10;
+    let shift_xdsub: i32 = 12;
+
+    let mut accum_h: i64 = 0;
+    let mut accum_v: i64 = 0;
+    let mut accum_d: i64 = 0;
+
+    if start_row < end_row && start_col < end_col {
+        let mut prev = AdmCmScale0Row::with_capacity(w);
+        let mut cur = AdmCmScale0Row::with_capacity(w);
+        let mut next = AdmCmScale0Row::with_capacity(w);
+
+        prev.refill(
+            row(ref_h, w, start_row - 1),
+            row(ref_v, w, start_row - 1),
+            row(ref_d, w, start_row - 1),
+            row(dis_h, w, start_row - 1),
+            row(dis_v, w, start_row - 1),
+            row(dis_d, w, start_row - 1),
+            adm_enhn_gain_limit,
+        );
+        cur.refill(
+            row(ref_h, w, start_row),
+            row(ref_v, w, start_row),
+            row(ref_d, w, start_row),
+            row(dis_h, w, start_row),
+            row(dis_v, w, start_row),
+            row(dis_d, w, start_row),
+            adm_enhn_gain_limit,
+        );
+        next.refill(
+            row(ref_h, w, start_row + 1),
+            row(ref_v, w, start_row + 1),
+            row(ref_d, w, start_row + 1),
+            row(dis_h, w, start_row + 1),
+            row(dis_v, w, start_row + 1),
+            row(dis_d, w, start_row + 1),
+            adm_enhn_gain_limit,
+        );
+
+        for i in start_row..end_row {
+            let mut inner_h: i64 = 0;
+            let mut inner_v: i64 = 0;
+            let mut inner_d: i64 = 0;
+
+            for j in start_col..end_col {
+                let thr = threshold_scale0(&prev, &cur, &next, j);
+
+                {
+                    let mut x = cur.scaled_h[j].abs() - (thr << shift_xhsub);
+                    if x < 0 {
+                        x = 0;
+                    }
+                    let x_sq = (((x as i64 * x as i64) + add_shift_xhsq) >> shift_xhsq) as i32;
+                    inner_h += ((x_sq as i64 * x as i64) + add_shift_xhcub) >> shift_xhcub;
+                }
+                {
+                    let mut x = cur.scaled_v[j].abs() - (thr << shift_xvsub);
+                    if x < 0 {
+                        x = 0;
+                    }
+                    let x_sq = (((x as i64 * x as i64) + add_shift_xvsq) >> shift_xvsq) as i32;
+                    inner_v += ((x_sq as i64 * x as i64) + add_shift_xvcub) >> shift_xvcub;
+                }
+                {
+                    let mut x = cur.scaled_d[j].abs() - (thr << shift_xdsub);
+                    if x < 0 {
+                        x = 0;
+                    }
+                    let x_sq = (((x as i64 * x as i64) + add_shift_xdsq) >> shift_xdsq) as i32;
+                    inner_d += ((x_sq as i64 * x as i64) + add_shift_xdcub) >> shift_xdcub;
+                }
+            }
+
+            accum_h += (inner_h + add_shift_inner_accum) >> shift_inner_accum;
+            accum_v += (inner_v + add_shift_inner_accum) >> shift_inner_accum;
+            accum_d += (inner_d + add_shift_inner_accum) >> shift_inner_accum;
+
+            if i + 1 < end_row {
+                std::mem::swap(&mut prev, &mut cur);
+                std::mem::swap(&mut cur, &mut next);
+                let fill_row = i + 2;
+                next.refill(
+                    row(ref_h, w, fill_row),
+                    row(ref_v, w, fill_row),
+                    row(ref_d, w, fill_row),
+                    row(dis_h, w, fill_row),
+                    row(dis_v, w, fill_row),
+                    row(dis_d, w, fill_row),
+                    adm_enhn_gain_limit,
+                );
+            }
+        }
+    }
+
+    let area = (bottom - top) * (right - left);
+    let f_accum_h =
+        (accum_h as f64 / 2.0f64.powi(52 - shift_xhcub as i32 - shift_inner_accum as i32)) as f32;
+    let f_accum_v =
+        (accum_v as f64 / 2.0f64.powi(52 - shift_xvcub as i32 - shift_inner_accum as i32)) as f32;
+    let f_accum_d =
+        (accum_d as f64 / 2.0f64.powi(57 - shift_xdcub as i32 - shift_inner_accum as i32)) as f32;
+
+    let powf_add = (area as f32 / 32.0).powf(1.0 / 3.0);
+    f_accum_h.powf(1.0 / 3.0)
+        + powf_add
+        + f_accum_v.powf(1.0 / 3.0)
+        + powf_add
+        + f_accum_d.powf(1.0 / 3.0)
+        + powf_add
+}
+
+fn adm_cm_s123(
+    ref_h: &[i32],
+    ref_v: &[i32],
+    ref_d: &[i32],
+    dis_h: &[i32],
+    dis_v: &[i32],
+    dis_d: &[i32],
+    scale: usize,
+    w: usize,
+    h: usize,
+    i_rfactor: [u32; 3],
+    adm_enhn_gain_limit: f64,
+) -> f32 {
+    let n = w * h;
+    debug_assert_eq!(ref_h.len(), n);
+    debug_assert_eq!(ref_v.len(), n);
+    debug_assert_eq!(ref_d.len(), n);
+    debug_assert_eq!(dis_h.len(), n);
+    debug_assert_eq!(dis_v.len(), n);
+    debug_assert_eq!(dis_d.len(), n);
+
+    let (left, top, right, bottom) = accum_border(w, h);
+    let start_col = left.max(1);
+    let end_col = right.min(w.saturating_sub(1));
+    let start_row = top.max(1);
+    let end_row = bottom.min(h.saturating_sub(1));
+
+    let shift_cub = ceil_log2_u32(w as u32);
+    let add_shift_cub = if shift_cub > 0 {
+        1i64 << (shift_cub - 1)
+    } else {
+        0
+    };
+
+    let shift_inner_accum = ceil_log2_u32(h as u32);
+    let add_shift_inner_accum = if shift_inner_accum > 0 {
+        1i64 << (shift_inner_accum - 1)
+    } else {
+        0
+    };
+
+    let base_exp: i32 = match scale {
+        1 => 45,
+        2 => 39,
+        3 => 36,
+        _ => unreachable!(),
+    };
+    let final_shift = 2.0f64.powi(base_exp - shift_cub as i32 - shift_inner_accum as i32) as f32;
+
+    let shift_sq: i32 = 30;
+    let add_shift_sq: i64 = 536_870_912;
+
+    let mut accum_h: i64 = 0;
+    let mut accum_v: i64 = 0;
+    let mut accum_d: i64 = 0;
+
+    if start_row < end_row && start_col < end_col {
+        let mut prev = AdmCmScale123Row::with_capacity(w);
+        let mut cur = AdmCmScale123Row::with_capacity(w);
+        let mut next = AdmCmScale123Row::with_capacity(w);
+
+        prev.refill(
+            row(ref_h, w, start_row - 1),
+            row(ref_v, w, start_row - 1),
+            row(ref_d, w, start_row - 1),
+            row(dis_h, w, start_row - 1),
+            row(dis_v, w, start_row - 1),
+            row(dis_d, w, start_row - 1),
+            adm_enhn_gain_limit,
+            i_rfactor,
+        );
+        cur.refill(
+            row(ref_h, w, start_row),
+            row(ref_v, w, start_row),
+            row(ref_d, w, start_row),
+            row(dis_h, w, start_row),
+            row(dis_v, w, start_row),
+            row(dis_d, w, start_row),
+            adm_enhn_gain_limit,
+            i_rfactor,
+        );
+        next.refill(
+            row(ref_h, w, start_row + 1),
+            row(ref_v, w, start_row + 1),
+            row(ref_d, w, start_row + 1),
+            row(dis_h, w, start_row + 1),
+            row(dis_v, w, start_row + 1),
+            row(dis_d, w, start_row + 1),
+            adm_enhn_gain_limit,
+            i_rfactor,
+        );
+
+        for i in start_row..end_row {
+            let mut inner_h: i64 = 0;
+            let mut inner_v: i64 = 0;
+            let mut inner_d: i64 = 0;
+
+            for j in start_col..end_col {
+                let thr = threshold_scale123(&prev, &cur, &next, j);
+
+                {
+                    let mut x = cur.scaled_h[j].abs() - thr;
+                    if x < 0 {
+                        x = 0;
+                    }
+                    let x_sq = (((x as i64 * x as i64) + add_shift_sq) >> shift_sq) as i32;
+                    inner_h += ((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub;
+                }
+                {
+                    let mut x = cur.scaled_v[j].abs() - thr;
+                    if x < 0 {
+                        x = 0;
+                    }
+                    let x_sq = (((x as i64 * x as i64) + add_shift_sq) >> shift_sq) as i32;
+                    inner_v += ((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub;
+                }
+                {
+                    let mut x = cur.scaled_d[j].abs() - thr;
+                    if x < 0 {
+                        x = 0;
+                    }
+                    let x_sq = (((x as i64 * x as i64) + add_shift_sq) >> shift_sq) as i32;
+                    inner_d += ((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub;
+                }
+            }
+
+            accum_h += (inner_h + add_shift_inner_accum) >> shift_inner_accum;
+            accum_v += (inner_v + add_shift_inner_accum) >> shift_inner_accum;
+            accum_d += (inner_d + add_shift_inner_accum) >> shift_inner_accum;
+
+            if i + 1 < end_row {
+                std::mem::swap(&mut prev, &mut cur);
+                std::mem::swap(&mut cur, &mut next);
+                let fill_row = i + 2;
+                next.refill(
+                    row(ref_h, w, fill_row),
+                    row(ref_v, w, fill_row),
+                    row(ref_d, w, fill_row),
+                    row(dis_h, w, fill_row),
+                    row(dis_v, w, fill_row),
+                    row(dis_d, w, fill_row),
+                    adm_enhn_gain_limit,
+                    i_rfactor,
+                );
+            }
+        }
+    }
+
+    let area = (bottom - top) * (right - left);
+    let f_accum_h = accum_h as f32 / final_shift;
+    let f_accum_v = accum_v as f32 / final_shift;
+    let f_accum_d = accum_d as f32 / final_shift;
+
+    let powf_add = (area as f32 / 32.0).powf(1.0 / 3.0);
+    f_accum_h.powf(1.0 / 3.0)
+        + powf_add
+        + f_accum_v.powf(1.0 / 3.0)
+        + powf_add
+        + f_accum_d.powf(1.0 / 3.0)
+        + powf_add
+}
+
+#[cfg(test)]
+fn csf_scale0_reference(
+    art_h: &[i16],
+    art_v: &[i16],
+    art_d: &[i16],
+) -> (Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>, Vec<i16>) {
+    let n = art_h.len();
+    debug_assert_eq!(art_v.len(), n);
+    debug_assert_eq!(art_d.len(), n);
+
+    let mut csf_a_h = Vec::with_capacity(n);
+    let mut csf_a_v = Vec::with_capacity(n);
+    let mut csf_a_d = Vec::with_capacity(n);
+    let mut csf_f_h = Vec::with_capacity(n);
+    let mut csf_f_v = Vec::with_capacity(n);
+    let mut csf_f_d = Vec::with_capacity(n);
+
+    for k in 0..n {
+        let (csf_a, csf_f) = csf_scale0_triplet(art_h[k], art_v[k], art_d[k]);
+        csf_a_h.push(csf_a[0]);
+        csf_a_v.push(csf_a[1]);
+        csf_a_d.push(csf_a[2]);
+        csf_f_h.push(csf_f[0]);
+        csf_f_v.push(csf_f[1]);
+        csf_f_d.push(csf_f[2]);
+    }
+
+    (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d)
+}
+
+#[cfg(test)]
+fn csf_s123_reference(
+    art_h: &[i32],
+    art_v: &[i32],
+    art_d: &[i32],
+    i_rfactor: [u32; 3],
+) -> (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>, Vec<i32>) {
+    let n = art_h.len();
+    debug_assert_eq!(art_v.len(), n);
+    debug_assert_eq!(art_d.len(), n);
+
+    let mut csf_a_h = Vec::with_capacity(n);
+    let mut csf_a_v = Vec::with_capacity(n);
+    let mut csf_a_d = Vec::with_capacity(n);
+    let mut csf_f_h = Vec::with_capacity(n);
+    let mut csf_f_v = Vec::with_capacity(n);
+    let mut csf_f_d = Vec::with_capacity(n);
+
+    for k in 0..n {
+        let (csf_a, csf_f) = csf_s123_triplet(art_h[k], art_v[k], art_d[k], i_rfactor);
+        csf_a_h.push(csf_a[0]);
+        csf_a_v.push(csf_a[1]);
+        csf_a_d.push(csf_a[2]);
+        csf_f_h.push(csf_f[0]);
+        csf_f_v.push(csf_f[1]);
+        csf_f_d.push(csf_f[2]);
+    }
+
+    (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d)
+}
+
+#[cfg(test)]
+fn adm_cm_scale0_reference(
     rst_h: &[i16],
     rst_v: &[i16],
     rst_d: &[i16],
@@ -288,41 +912,39 @@ fn adm_cm_scale0(
     h: usize,
 ) -> f32 {
     let (left, top, right, bottom) = accum_border(w, h);
-
-    let start_col = if left > 1 { left } else { 1 };
-    let end_col = if right < (w - 1) { right } else { w - 1 };
-    let start_row = if top > 1 { top } else { 1 };
-    let end_row = if bottom < (h - 1) { bottom } else { h - 1 };
+    let start_col = left.max(1);
+    let end_col = right.min(w.saturating_sub(1));
+    let start_row = top.max(1);
+    let end_row = bottom.min(h.saturating_sub(1));
 
     let shift_xhsq: i32 = 29;
     let shift_xvsq: i32 = 29;
     let shift_xdsq: i32 = 30;
-    let add_shift_xhsq: i64 = 268_435_456; // 2^28
+    let add_shift_xhsq: i64 = 268_435_456;
     let add_shift_xvsq: i64 = 268_435_456;
-    let add_shift_xdsq: i64 = 536_870_912; // 2^29
+    let add_shift_xdsq: i64 = 536_870_912;
 
     let shift_xhcub = ceil_log2_u32(w as u32).saturating_sub(4);
     let shift_xvcub = ceil_log2_u32(w as u32).saturating_sub(4);
     let shift_xdcub = ceil_log2_u32(w as u32).saturating_sub(3);
-
-    let add_shift_xhcub: i64 = if shift_xhcub > 0 {
+    let add_shift_xhcub = if shift_xhcub > 0 {
         1i64 << (shift_xhcub - 1)
     } else {
         0
     };
-    let add_shift_xvcub: i64 = if shift_xvcub > 0 {
+    let add_shift_xvcub = if shift_xvcub > 0 {
         1i64 << (shift_xvcub - 1)
     } else {
         0
     };
-    let add_shift_xdcub: i64 = if shift_xdcub > 0 {
+    let add_shift_xdcub = if shift_xdcub > 0 {
         1i64 << (shift_xdcub - 1)
     } else {
         0
     };
 
     let shift_inner_accum = ceil_log2_u32(h as u32);
-    let add_shift_inner_accum: i64 = if shift_inner_accum > 0 {
+    let add_shift_inner_accum = if shift_inner_accum > 0 {
         1i64 << (shift_inner_accum - 1)
     } else {
         0
@@ -331,9 +953,6 @@ fn adm_cm_scale0(
     let shift_xhsub: i32 = 10;
     let shift_xvsub: i32 = 10;
     let shift_xdsub: i32 = 12;
-
-    // Default-viewing-distance fixed-point factors from libvmaf.
-    let i_rfactor: [i32; 3] = [36453, 36453, 49417];
 
     let mut accum_h: i64 = 0;
     let mut accum_v: i64 = 0;
@@ -346,7 +965,6 @@ fn adm_cm_scale0(
 
         for j in start_col..end_col {
             let idx = i * w + j;
-
             let thr = {
                 let mut thr_total: i32 = 0;
                 for (csf_a, csf_f) in [(csf_a_h, csf_f_h), (csf_a_v, csf_f_v), (csf_a_d, csf_f_d)] {
@@ -358,11 +976,10 @@ fn adm_cm_scale0(
                     sum += csf_f[r0 + j - 1] as i32;
                     sum += csf_f[r0 + j] as i32;
                     sum += csf_f[r0 + j + 1] as i32;
-
                     sum += csf_f[r1 + j - 1] as i32;
-                    sum += ((ONE_BY_15 * (csf_a[r1 + j] as i32).abs()) + 2048) >> 12;
+                    sum += ((ONE_BY_15 * (csf_a[r1 + j] as i32).abs()) + SCALE0_FIX_ONE_BY_30_ADD)
+                        >> 12;
                     sum += csf_f[r1 + j + 1] as i32;
-
                     sum += csf_f[r2 + j - 1] as i32;
                     sum += csf_f[r2 + j] as i32;
                     sum += csf_f[r2 + j + 1] as i32;
@@ -372,39 +989,32 @@ fn adm_cm_scale0(
                 thr_total
             };
 
-            let xh = (rst_h[idx] as i32) * i_rfactor[0];
-            let xv = (rst_v[idx] as i32) * i_rfactor[1];
-            let xd = (rst_d[idx] as i32) * i_rfactor[2];
-
-            // ADM_CM_ACCUM_ROUND for H
             {
-                let mut x = xh.abs() - (thr << shift_xhsub);
+                let mut x =
+                    ((rst_h[idx] as i32) * SCALE0_CSF_RFACTOR[0]).abs() - (thr << shift_xhsub);
                 if x < 0 {
                     x = 0;
                 }
                 let x_sq = (((x as i64 * x as i64) + add_shift_xhsq) >> shift_xhsq) as i32;
-                let val = (((x_sq as i64 * x as i64) + add_shift_xhcub) >> shift_xhcub) as i64;
-                inner_h += val;
+                inner_h += ((x_sq as i64 * x as i64) + add_shift_xhcub) >> shift_xhcub;
             }
-            // V
             {
-                let mut x = xv.abs() - (thr << shift_xvsub);
+                let mut x =
+                    ((rst_v[idx] as i32) * SCALE0_CSF_RFACTOR[1]).abs() - (thr << shift_xvsub);
                 if x < 0 {
                     x = 0;
                 }
                 let x_sq = (((x as i64 * x as i64) + add_shift_xvsq) >> shift_xvsq) as i32;
-                let val = (((x_sq as i64 * x as i64) + add_shift_xvcub) >> shift_xvcub) as i64;
-                inner_v += val;
+                inner_v += ((x_sq as i64 * x as i64) + add_shift_xvcub) >> shift_xvcub;
             }
-            // D
             {
-                let mut x = xd.abs() - (thr << shift_xdsub);
+                let mut x =
+                    ((rst_d[idx] as i32) * SCALE0_CSF_RFACTOR[2]).abs() - (thr << shift_xdsub);
                 if x < 0 {
                     x = 0;
                 }
                 let x_sq = (((x as i64 * x as i64) + add_shift_xdsq) >> shift_xdsq) as i32;
-                let val = (((x_sq as i64 * x as i64) + add_shift_xdcub) >> shift_xdcub) as i64;
-                inner_d += val;
+                inner_d += ((x_sq as i64 * x as i64) + add_shift_xdcub) >> shift_xdcub;
             }
         }
 
@@ -414,16 +1024,12 @@ fn adm_cm_scale0(
     }
 
     let area = (bottom - top) * (right - left);
-
-    let f_accum_h = (accum_h as f64
-        / 2.0f64.powi((52 - shift_xhcub as i32 - shift_inner_accum as i32) as i32))
-        as f32;
-    let f_accum_v = (accum_v as f64
-        / 2.0f64.powi((52 - shift_xvcub as i32 - shift_inner_accum as i32) as i32))
-        as f32;
-    let f_accum_d = (accum_d as f64
-        / 2.0f64.powi((57 - shift_xdcub as i32 - shift_inner_accum as i32) as i32))
-        as f32;
+    let f_accum_h =
+        (accum_h as f64 / 2.0f64.powi(52 - shift_xhcub as i32 - shift_inner_accum as i32)) as f32;
+    let f_accum_v =
+        (accum_v as f64 / 2.0f64.powi(52 - shift_xvcub as i32 - shift_inner_accum as i32)) as f32;
+    let f_accum_d =
+        (accum_d as f64 / 2.0f64.powi(57 - shift_xdcub as i32 - shift_inner_accum as i32)) as f32;
 
     let powf_add = (area as f32 / 32.0).powf(1.0 / 3.0);
     f_accum_h.powf(1.0 / 3.0)
@@ -434,7 +1040,8 @@ fn adm_cm_scale0(
         + powf_add
 }
 
-fn adm_cm_s123(
+#[cfg(test)]
+fn adm_cm_s123_reference(
     rst_h: &[i32],
     rst_v: &[i32],
     rst_d: &[i32],
@@ -447,37 +1054,22 @@ fn adm_cm_s123(
     scale: usize,
     w: usize,
     h: usize,
-    rfactor: [f32; 3],
+    i_rfactor: [u32; 3],
 ) -> f32 {
     let (left, top, right, bottom) = accum_border(w, h);
-
-    let start_col = if left > 1 { left } else { 1 };
-    let end_col = if right < (w - 1) { right } else { w - 1 };
-    let start_row = if top > 1 { top } else { 1 };
-    let end_row = if bottom < (h - 1) { bottom } else { h - 1 };
-
-    let pow2_32 = 4294967296.0f64;
-    let rfactor_fp: [u32; 3] = [
-        (rfactor[0] as f64 * pow2_32) as u32,
-        (rfactor[1] as f64 * pow2_32) as u32,
-        (rfactor[2] as f64 * pow2_32) as u32,
-    ];
-
-    const SHIFT_DST: u32 = 28;
-    const SHIFT_FLT: u32 = 32;
-
-    let add_bef_shift_dst: i64 = 1i64 << (SHIFT_DST - 1);
-    let add_bef_shift_flt: i64 = 1i64 << (SHIFT_FLT - 1);
+    let start_col = left.max(1);
+    let end_col = right.min(w.saturating_sub(1));
+    let start_row = top.max(1);
+    let end_row = bottom.min(h.saturating_sub(1));
 
     let shift_cub = ceil_log2_u32(w as u32);
-    let add_shift_cub: i64 = if shift_cub > 0 {
+    let add_shift_cub = if shift_cub > 0 {
         1i64 << (shift_cub - 1)
     } else {
         0
     };
-
     let shift_inner_accum = ceil_log2_u32(h as u32);
-    let add_shift_inner_accum: i64 = if shift_inner_accum > 0 {
+    let add_shift_inner_accum = if shift_inner_accum > 0 {
         1i64 << (shift_inner_accum - 1)
     } else {
         0
@@ -489,11 +1081,10 @@ fn adm_cm_s123(
         3 => 36,
         _ => unreachable!(),
     };
-    let final_shift: f32 =
-        (2.0f64).powi(base_exp - shift_cub as i32 - shift_inner_accum as i32) as f32;
+    let final_shift = 2.0f64.powi(base_exp - shift_cub as i32 - shift_inner_accum as i32) as f32;
 
     let shift_sq: i32 = 30;
-    let add_shift_sq: i64 = 536_870_912; // 2^29
+    let add_shift_sq: i64 = 536_870_912;
 
     let mut accum_h: i64 = 0;
     let mut accum_v: i64 = 0;
@@ -506,14 +1097,6 @@ fn adm_cm_s123(
 
         for j in start_col..end_col {
             let idx = i * w + j;
-
-            let xh = (((rst_h[idx] as i64) * (rfactor_fp[0] as i64) + add_bef_shift_dst)
-                >> SHIFT_DST) as i32;
-            let xv = (((rst_v[idx] as i64) * (rfactor_fp[1] as i64) + add_bef_shift_dst)
-                >> SHIFT_DST) as i32;
-            let xd = (((rst_d[idx] as i64) * (rfactor_fp[2] as i64) + add_bef_shift_dst)
-                >> SHIFT_DST) as i32;
-
             let thr = {
                 let mut thr_total: i32 = 0;
                 for (csf_a, csf_f) in [(csf_a_h, csf_f_h), (csf_a_v, csf_f_v), (csf_a_d, csf_f_d)] {
@@ -525,12 +1108,11 @@ fn adm_cm_s123(
                     sum += csf_f[r0 + j - 1];
                     sum += csf_f[r0 + j];
                     sum += csf_f[r0 + j + 1];
-
                     sum += csf_f[r1 + j - 1];
-                    sum += (((I4_ONE_BY_15 * (csf_a[r1 + j] as i64).abs()) + add_bef_shift_flt)
-                        >> SHIFT_FLT) as i32;
+                    sum += (((I4_ONE_BY_15 * (csf_a[r1 + j] as i64).abs())
+                        + S123_ADD_BEFORE_SHIFT_FLT)
+                        >> S123_SHIFT_FLT) as i32;
                     sum += csf_f[r1 + j + 1];
-
                     sum += csf_f[r2 + j - 1];
                     sum += csf_f[r2 + j];
                     sum += csf_f[r2 + j + 1];
@@ -540,33 +1122,41 @@ fn adm_cm_s123(
                 thr_total
             };
 
-            // I4_ADM_CM_ACCUM_ROUND (shift_sub = 0)
             {
-                let mut x = xh.abs() - thr;
+                let mut x = ((((rst_h[idx] as i64) * (i_rfactor[0] as i64)
+                    + S123_ADD_BEFORE_SHIFT_DST)
+                    >> S123_SHIFT_DST) as i32)
+                    .abs()
+                    - thr;
                 if x < 0 {
                     x = 0;
                 }
                 let x_sq = (((x as i64 * x as i64) + add_shift_sq) >> shift_sq) as i32;
-                let val = (((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub) as i64;
-                inner_h += val;
+                inner_h += ((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub;
             }
             {
-                let mut x = xv.abs() - thr;
+                let mut x = ((((rst_v[idx] as i64) * (i_rfactor[1] as i64)
+                    + S123_ADD_BEFORE_SHIFT_DST)
+                    >> S123_SHIFT_DST) as i32)
+                    .abs()
+                    - thr;
                 if x < 0 {
                     x = 0;
                 }
                 let x_sq = (((x as i64 * x as i64) + add_shift_sq) >> shift_sq) as i32;
-                let val = (((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub) as i64;
-                inner_v += val;
+                inner_v += ((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub;
             }
             {
-                let mut x = xd.abs() - thr;
+                let mut x = ((((rst_d[idx] as i64) * (i_rfactor[2] as i64)
+                    + S123_ADD_BEFORE_SHIFT_DST)
+                    >> S123_SHIFT_DST) as i32)
+                    .abs()
+                    - thr;
                 if x < 0 {
                     x = 0;
                 }
                 let x_sq = (((x as i64 * x as i64) + add_shift_sq) >> shift_sq) as i32;
-                let val = (((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub) as i64;
-                inner_d += val;
+                inner_d += ((x_sq as i64 * x as i64) + add_shift_cub) >> shift_cub;
             }
         }
 
@@ -576,9 +1166,9 @@ fn adm_cm_s123(
     }
 
     let area = (bottom - top) * (right - left);
-    let f_accum_h = (accum_h as f32) / final_shift;
-    let f_accum_v = (accum_v as f32) / final_shift;
-    let f_accum_d = (accum_d as f32) / final_shift;
+    let f_accum_h = accum_h as f32 / final_shift;
+    let f_accum_v = accum_v as f32 / final_shift;
+    let f_accum_d = accum_d as f32 / final_shift;
 
     let powf_add = (area as f32 / 32.0).powf(1.0 / 3.0);
     f_accum_h.powf(1.0 / 3.0)
@@ -589,25 +1179,143 @@ fn adm_cm_s123(
         + powf_add
 }
 
+#[cfg(test)]
+pub(crate) fn score_scale0_reference(
+    ref_h: &[i16],
+    ref_v: &[i16],
+    ref_d: &[i16],
+    dis_h: &[i16],
+    dis_v: &[i16],
+    dis_d: &[i16],
+    adm_enhn_gain_limit: f64,
+    width: usize,
+    height: usize,
+) -> (f32, f32) {
+    let n = width * height;
+    debug_assert_eq!(ref_h.len(), n);
+    debug_assert_eq!(ref_v.len(), n);
+    debug_assert_eq!(ref_d.len(), n);
+    debug_assert_eq!(dis_h.len(), n);
+    debug_assert_eq!(dis_v.len(), n);
+    debug_assert_eq!(dis_d.len(), n);
+
+    let mut rst_h = Vec::with_capacity(n);
+    let mut rst_v = Vec::with_capacity(n);
+    let mut rst_d = Vec::with_capacity(n);
+    let mut art_h = Vec::with_capacity(n);
+    let mut art_v = Vec::with_capacity(n);
+    let mut art_d = Vec::with_capacity(n);
+
+    for k in 0..n {
+        let (rh, rv, rd, ah, av, ad) = decouple_scale0(
+            ref_h[k],
+            ref_v[k],
+            ref_d[k],
+            dis_h[k],
+            dis_v[k],
+            dis_d[k],
+            adm_enhn_gain_limit,
+        );
+        rst_h.push(rh);
+        rst_v.push(rv);
+        rst_d.push(rd);
+        art_h.push(ah);
+        art_v.push(av);
+        art_d.push(ad);
+    }
+
+    let rfactor = noise_floor::rfactor(0);
+    let (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d) =
+        csf_scale0_reference(&art_h, &art_v, &art_d);
+    let num = adm_cm_scale0_reference(
+        &rst_h, &rst_v, &rst_d, &csf_a_h, &csf_a_v, &csf_a_d, &csf_f_h, &csf_f_v, &csf_f_d, width,
+        height,
+    );
+    let den = adm_csf_den_scale0(ref_h, ref_v, ref_d, width, height, rfactor);
+    (num, den)
+}
+
+#[cfg(test)]
+pub(crate) fn score_scale_s123_reference(
+    ref_h: &[i32],
+    ref_v: &[i32],
+    ref_d: &[i32],
+    dis_h: &[i32],
+    dis_v: &[i32],
+    dis_d: &[i32],
+    adm_enhn_gain_limit: f64,
+    scale: usize,
+    width: usize,
+    height: usize,
+) -> (f32, f32) {
+    let n = width * height;
+    debug_assert_eq!(ref_h.len(), n);
+    debug_assert_eq!(ref_v.len(), n);
+    debug_assert_eq!(ref_d.len(), n);
+    debug_assert_eq!(dis_h.len(), n);
+    debug_assert_eq!(dis_v.len(), n);
+    debug_assert_eq!(dis_d.len(), n);
+
+    let mut rst_h = Vec::with_capacity(n);
+    let mut rst_v = Vec::with_capacity(n);
+    let mut rst_d = Vec::with_capacity(n);
+    let mut art_h = Vec::with_capacity(n);
+    let mut art_v = Vec::with_capacity(n);
+    let mut art_d = Vec::with_capacity(n);
+
+    for k in 0..n {
+        let (rh, rv, rd, ah, av, ad) = decouple_s123(
+            ref_h[k],
+            ref_v[k],
+            ref_d[k],
+            dis_h[k],
+            dis_v[k],
+            dis_d[k],
+            adm_enhn_gain_limit,
+        );
+        rst_h.push(rh);
+        rst_v.push(rv);
+        rst_d.push(rd);
+        art_h.push(ah);
+        art_v.push(av);
+        art_d.push(ad);
+    }
+
+    let rfactor = noise_floor::rfactor(scale);
+    let i_rfactor = scale123_rfactor_fp(rfactor);
+    let (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d) =
+        csf_s123_reference(&art_h, &art_v, &art_d, i_rfactor);
+    let num = adm_cm_s123_reference(
+        &rst_h, &rst_v, &rst_d, &csf_a_h, &csf_a_v, &csf_a_d, &csf_f_h, &csf_f_v, &csf_f_d, scale,
+        width, height, i_rfactor,
+    );
+    let den = adm_csf_den_s123(ref_h, ref_v, ref_d, scale, width, height, rfactor);
+    (num, den)
+}
+
 /// Score scale 0: returns `(num_scale, den_scale)`.
 pub(crate) fn score_scale0(
     ref_h: &[i16],
     ref_v: &[i16],
     ref_d: &[i16],
-    rst_h: &[i16],
-    rst_v: &[i16],
-    rst_d: &[i16],
-    art_h: &[i16],
-    art_v: &[i16],
-    art_d: &[i16],
+    dis_h: &[i16],
+    dis_v: &[i16],
+    dis_d: &[i16],
+    adm_enhn_gain_limit: f64,
     width: usize,
     height: usize,
 ) -> (f32, f32) {
     let rfactor = noise_floor::rfactor(0);
-    let (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d) = csf_scale0(art_h, art_v, art_d);
     let num = adm_cm_scale0(
-        rst_h, rst_v, rst_d, &csf_a_h, &csf_a_v, &csf_a_d, &csf_f_h, &csf_f_v, &csf_f_d, width,
+        ref_h,
+        ref_v,
+        ref_d,
+        dis_h,
+        dis_v,
+        dis_d,
+        width,
         height,
+        adm_enhn_gain_limit,
     );
     let den = adm_csf_den_scale0(ref_h, ref_v, ref_d, width, height, rfactor);
     (num, den)
@@ -618,22 +1326,28 @@ pub(crate) fn score_scale_s123(
     ref_h: &[i32],
     ref_v: &[i32],
     ref_d: &[i32],
-    rst_h: &[i32],
-    rst_v: &[i32],
-    rst_d: &[i32],
-    art_h: &[i32],
-    art_v: &[i32],
-    art_d: &[i32],
+    dis_h: &[i32],
+    dis_v: &[i32],
+    dis_d: &[i32],
+    adm_enhn_gain_limit: f64,
     scale: usize,
     width: usize,
     height: usize,
 ) -> (f32, f32) {
     let rfactor = noise_floor::rfactor(scale);
-    let (csf_a_h, csf_a_v, csf_a_d, csf_f_h, csf_f_v, csf_f_d) =
-        csf_s123(art_h, art_v, art_d, scale, rfactor);
+    let i_rfactor = scale123_rfactor_fp(rfactor);
     let num = adm_cm_s123(
-        rst_h, rst_v, rst_d, &csf_a_h, &csf_a_v, &csf_a_d, &csf_f_h, &csf_f_v, &csf_f_d, scale,
-        width, height, rfactor,
+        ref_h,
+        ref_v,
+        ref_d,
+        dis_h,
+        dis_v,
+        dis_d,
+        scale,
+        width,
+        height,
+        i_rfactor,
+        adm_enhn_gain_limit,
     );
     let den = adm_csf_den_s123(ref_h, ref_v, ref_d, scale, width, height, rfactor);
     (num, den)
