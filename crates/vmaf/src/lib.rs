@@ -1,12 +1,12 @@
 //! vmaf — public API and pipeline orchestration — spec §2
 #![deny(unsafe_code)]
 
-use vmaf_adm::AdmExtractor;
+use vmaf_adm::{AdmExtractor, AdmWorkspace};
 use vmaf_model::{
     collect_scores, denormalize, normalize_features, pool, score_transform, svm_predict,
 };
 use vmaf_motion::MotionExtractor;
-use vmaf_vif::VifExtractor;
+use vmaf_vif::{VifExtractor, VifWorkspace};
 
 pub use vmaf_model::{load_model, PoolMethod, VmafModel};
 
@@ -44,7 +44,9 @@ pub struct VmafOptions {
 pub struct VmafContext {
     model: VmafModel,
     vif: VifExtractor,
+    vif_workspace: VifWorkspace,
     adm: AdmExtractor,
+    adm_workspace: AdmWorkspace,
     motion: MotionExtractor,
     width: usize,
     pending: Vec<PendingFrame>,
@@ -65,9 +67,15 @@ impl VmafContext {
         bpc: u8,
         opts: VmafOptions,
     ) -> Self {
+        let vif = VifExtractor::new(width, height, bpc, model.vif_enhn_gain_limit);
+        let vif_workspace = vif.make_workspace();
+        let adm = AdmExtractor::new(width, height, bpc, model.adm_enhn_gain_limit);
+        let adm_workspace = adm.make_workspace();
         Self {
-            vif: VifExtractor::new(width, height, bpc, model.vif_enhn_gain_limit),
-            adm: AdmExtractor::new(width, height, bpc, model.adm_enhn_gain_limit),
+            vif,
+            vif_workspace,
+            adm,
+            adm_workspace,
             motion: MotionExtractor::new(width, height, bpc),
             model,
             width,
@@ -81,8 +89,12 @@ impl VmafContext {
     /// Push a reference/distorted frame pair. Returns a `FrameScore` when one
     /// becomes available (motion has a 1-frame lag).
     pub fn push_frame(&mut self, reference: &[u16], distorted: &[u16]) -> Option<FrameScore> {
-        let vif_scores = self.vif.compute_frame(reference, distorted);
-        let adm_score = self.adm.compute_frame(reference, distorted);
+        let vif_scores =
+            self.vif
+                .compute_frame_with_workspace(&mut self.vif_workspace, reference, distorted);
+        let adm_score =
+            self.adm
+                .compute_frame_with_workspace(&mut self.adm_workspace, reference, distorted);
         let motion_result = self.motion.push_frame(reference, self.width);
 
         self.pending.push(PendingFrame {
@@ -116,12 +128,15 @@ impl VmafContext {
         let stride = self.width;
         let extracted: Vec<_> = frames
             .par_iter()
-            .map(|(r, d)| {
-                let vif_scores = vif.compute_frame(r, d);
-                let adm_score = adm.compute_frame(r, d);
-                let blur = motion.prepare_blurred_frame(r, stride);
-                (vif_scores, adm_score, blur)
-            })
+            .map_init(
+                || (vif.make_workspace(), adm.make_workspace()),
+                |(vif_workspace, adm_workspace), (r, d)| {
+                    let vif_scores = vif.compute_frame_with_workspace(vif_workspace, r, d);
+                    let adm_score = adm.compute_frame_with_workspace(adm_workspace, r, d);
+                    let blur = motion.prepare_blurred_frame(r, stride);
+                    (vif_scores, adm_score, blur)
+                },
+            )
             .collect();
 
         let mut out = Vec::new();
