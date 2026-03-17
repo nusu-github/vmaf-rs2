@@ -2,7 +2,13 @@
 
 use crate::math::{log2_32, log2_64, reflect_index};
 use crate::tables::{FILTER, FILTER_WIDTH, LOG2_TABLE};
+use vmaf_cpu::{Align32, AlignedScratch, SimdBackend};
 
+mod aarch64;
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+mod x86;
+
+const FILTER_TAP_CAP: usize = 18;
 const SIGMA_NSQ: u32 = 131072; // 2^17
 const EPSILON: f64 = 65536.0 * 1e-10; // ≈ 6.5536e-6
 
@@ -10,6 +16,14 @@ const EPSILON: f64 = 65536.0 * 1e-10; // ≈ 6.5536e-6
 pub(crate) struct ScaleStat {
     pub num: f64,
     pub den: f64,
+}
+
+#[derive(Default)]
+struct RunningStatAccumulators {
+    accum_num_log: i64,
+    accum_den_log: i64,
+    accum_num_non_log: i64,
+    accum_den_non_log: i64,
 }
 
 /// Compute VIF statistics for one scale — spec §4.2.6–4.2.8.
@@ -25,21 +39,147 @@ pub(crate) fn vif_statistic(
     bpc: u8,
     scale: usize,
     vif_enhn_gain_limit: f64,
+    backend: SimdBackend,
 ) -> ScaleStat {
-    let filt = &FILTER[scale];
-    let fw = FILTER_WIDTH[scale];
-    let half = fw / 2;
+    match backend {
+        SimdBackend::Scalar => vif_statistic_scalar(
+            ref_plane,
+            dis_plane,
+            width,
+            height,
+            bpc,
+            scale,
+            vif_enhn_gain_limit,
+        ),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        SimdBackend::X86Sse2 | SimdBackend::X86Avx2Fma | SimdBackend::X86Avx512 => {
+            x86::vif_statistic(
+                ref_plane,
+                dis_plane,
+                width,
+                height,
+                bpc,
+                scale,
+                vif_enhn_gain_limit,
+                backend,
+            )
+        }
+        SimdBackend::Aarch64Neon => aarch64::vif_statistic(
+            ref_plane,
+            dis_plane,
+            width,
+            height,
+            bpc,
+            scale,
+            vif_enhn_gain_limit,
+            backend,
+        ),
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        _ => vif_statistic_scalar(
+            ref_plane,
+            dis_plane,
+            width,
+            height,
+            bpc,
+            scale,
+            vif_enhn_gain_limit,
+        ),
+    }
+}
 
-    // Shift/round for mu accumulators
+fn vif_statistic_scalar(
+    ref_plane: &[u16],
+    dis_plane: &[u16],
+    width: usize,
+    height: usize,
+    bpc: u8,
+    scale: usize,
+    vif_enhn_gain_limit: f64,
+) -> ScaleStat {
+    let filt = &FILTER[scale][..FILTER_WIDTH[scale]];
+    let half = filt.len() / 2;
+    let (shift_mu, round_mu, sq_shift, sq_round64) = stat_params(bpc, scale);
+    let uses_wrapping_sq = bpc == 8 && scale == 0;
+    let mut accum = RunningStatAccumulators::default();
+
+    let mut tmp_mu1_buf = AlignedScratch::<u16, Align32>::zeroed(width);
+    let mut tmp_mu2_buf = AlignedScratch::<u16, Align32>::zeroed(width);
+    let mut tmp_ref_sq_buf = AlignedScratch::<u32, Align32>::zeroed(width);
+    let mut tmp_dis_sq_buf = AlignedScratch::<u32, Align32>::zeroed(width);
+    let mut tmp_ref_dis_buf = AlignedScratch::<u32, Align32>::zeroed(width);
+    let tmp_mu1 = tmp_mu1_buf.as_mut_slice();
+    let tmp_mu2 = tmp_mu2_buf.as_mut_slice();
+    let tmp_ref_sq = tmp_ref_sq_buf.as_mut_slice();
+    let tmp_dis_sq = tmp_dis_sq_buf.as_mut_slice();
+    let tmp_ref_dis = tmp_ref_dis_buf.as_mut_slice();
+
+    for i in 0..height {
+        let row_offsets = reflected_row_offsets(i, height, width, half, filt.len());
+
+        if uses_wrapping_sq {
+            vertical_scalar_range_wrapping(
+                ref_plane,
+                dis_plane,
+                &row_offsets[..filt.len()],
+                filt,
+                shift_mu,
+                round_mu,
+                0,
+                width,
+                tmp_mu1,
+                tmp_mu2,
+                tmp_ref_sq,
+                tmp_dis_sq,
+                tmp_ref_dis,
+            );
+        } else {
+            vertical_scalar_range_non_wrapping(
+                ref_plane,
+                dis_plane,
+                &row_offsets[..filt.len()],
+                filt,
+                shift_mu,
+                round_mu,
+                sq_shift,
+                sq_round64,
+                0,
+                width,
+                tmp_mu1,
+                tmp_mu2,
+                tmp_ref_sq,
+                tmp_dis_sq,
+                tmp_ref_dis,
+            );
+        }
+
+        horizontal_scalar_range(
+            tmp_mu1,
+            tmp_mu2,
+            tmp_ref_sq,
+            tmp_dis_sq,
+            tmp_ref_dis,
+            filt,
+            half,
+            0,
+            width,
+            vif_enhn_gain_limit,
+            &mut accum,
+        );
+    }
+
+    finalize_scale_stat(accum)
+}
+
+#[inline]
+fn stat_params(bpc: u8, scale: usize) -> (u32, u32, u32, u64) {
     let (shift_mu, round_mu) = if scale == 0 {
         (bpc as u32, 1u32 << (bpc - 1))
     } else {
         (16u32, 32768u32)
     };
 
-    // Shift/round for squared accumulators (64-bit path only)
-    let (sq_shift, sq_round64): (u32, u64) = if scale == 0 && bpc == 8 {
-        (0, 0) // unused — 8-bit scale-0 path uses u32 with no shift
+    let (sq_shift, sq_round64) = if scale == 0 && bpc == 8 {
+        (0, 0)
     } else if scale == 0 {
         let sh = (bpc as u32 - 8) * 2;
         (sh, 1u64 << (sh - 1))
@@ -47,154 +187,229 @@ pub(crate) fn vif_statistic(
         (16, 32768)
     };
 
-    let mut accum_num_log: i64 = 0;
-    let mut accum_den_log: i64 = 0;
-    let mut accum_num_non_log: i64 = 0;
-    let mut accum_den_non_log: i64 = 0;
+    (shift_mu, round_mu, sq_shift, sq_round64)
+}
 
-    // Per-row scratch buffers (un-padded)
-    let mut tmp_mu1 = vec![0u16; width];
-    let mut tmp_mu2 = vec![0u16; width];
-    let mut tmp_ref_sq = vec![0u32; width];
-    let mut tmp_dis_sq = vec![0u32; width];
-    let mut tmp_ref_dis = vec![0u32; width];
+#[inline]
+fn reflected_row_offsets(
+    i: usize,
+    height: usize,
+    width: usize,
+    half: usize,
+    taps: usize,
+) -> [usize; FILTER_TAP_CAP] {
+    let mut row_offsets = [0usize; FILTER_TAP_CAP];
 
-    for i in 0..height {
-        // ── Step 1: Vertical pass ──────────────────────────────────────────────
-
-        for j in 0..width {
-            let mut acc_mu1 = 0u32;
-            let mut acc_mu2 = 0u32;
-
-            if bpc == 8 && scale == 0 {
-                // 8-bit scale-0: uint32 squared accumulators (wrapping — intentional)
-                let mut acc_rsq = 0u32;
-                let mut acc_dsq = 0u32;
-                let mut acc_rdi = 0u32;
-
-                for fi in 0..fw {
-                    let ii = reflect_index(i as i32 - half as i32 + fi as i32, height as i32);
-                    let c = FILTER[0][fi] as u32;
-                    let r = ref_plane[ii * width + j] as u32;
-                    let d = dis_plane[ii * width + j] as u32;
-
-                    let cr = c * r; // c ≤ 7784, r ≤ 255 → product ≤ 1.98M, no overflow
-                    let cd = c * d;
-                    acc_mu1 += cr;
-                    acc_mu2 += cd;
-                    acc_rsq = acc_rsq.wrapping_add(cr * r); // sum wraps — intentional
-                    acc_dsq = acc_dsq.wrapping_add(cd * d);
-                    acc_rdi = acc_rdi.wrapping_add(cr * d);
-                }
-
-                tmp_ref_sq[j] = acc_rsq; // sq_shift = 0
-                tmp_dis_sq[j] = acc_dsq;
-                tmp_ref_dis[j] = acc_rdi;
-            } else {
-                // uint64 squared accumulators
-                let mut acc_rsq = 0u64;
-                let mut acc_dsq = 0u64;
-                let mut acc_rdi = 0u64;
-
-                for fi in 0..fw {
-                    let ii = reflect_index(i as i32 - half as i32 + fi as i32, height as i32);
-                    let c = filt[fi] as u32;
-                    let r = ref_plane[ii * width + j] as u32;
-                    let d = dis_plane[ii * width + j] as u32;
-
-                    let cr = c as u64 * r as u64;
-                    let cd = c as u64 * d as u64;
-                    acc_mu1 += c * r;
-                    acc_mu2 += c * d;
-                    acc_rsq += cr * r as u64;
-                    acc_dsq += cd * d as u64;
-                    acc_rdi += cr * d as u64;
-                }
-
-                tmp_ref_sq[j] = ((acc_rsq + sq_round64) >> sq_shift) as u32;
-                tmp_dis_sq[j] = ((acc_dsq + sq_round64) >> sq_shift) as u32;
-                tmp_ref_dis[j] = ((acc_rdi + sq_round64) >> sq_shift) as u32;
-            }
-
-            tmp_mu1[j] = ((acc_mu1 + round_mu) >> shift_mu) as u16;
-            tmp_mu2[j] = ((acc_mu2 + round_mu) >> shift_mu) as u16;
-        }
-
-        // ── Step 2: Horizontal pass (uses reflect_index for boundary) ──────────
-
-        for j in 0..width {
-            let mut acc_mu1 = 0u32;
-            let mut acc_mu2 = 0u32;
-            let mut acc_ref = 0u64;
-            let mut acc_dis = 0u64;
-            let mut acc_rdi = 0u64;
-
-            for fj in 0..fw {
-                // reflect_index gives the same result as the spec's padding approach
-                let jj = reflect_index(j as i32 - half as i32 + fj as i32, width as i32);
-                let c = filt[fj] as u32;
-
-                acc_mu1 += c * tmp_mu1[jj] as u32;
-                acc_mu2 += c * tmp_mu2[jj] as u32;
-                acc_ref += c as u64 * tmp_ref_sq[jj] as u64;
-                acc_dis += c as u64 * tmp_dis_sq[jj] as u64;
-                acc_rdi += c as u64 * tmp_ref_dis[jj] as u64;
-            }
-
-            let mu1_val = acc_mu1;
-            let mu2_val = acc_mu2;
-
-            // Square and cross-product of mu values in Q32
-            let mu1_sq = ((mu1_val as u64 * mu1_val as u64 + 2147483648) >> 32) as u32;
-            let mu2_sq = ((mu2_val as u64 * mu2_val as u64 + 2147483648) >> 32) as u32;
-            let mu1_mu2 = ((mu1_val as u64 * mu2_val as u64 + 2147483648) >> 32) as u32;
-
-            let ref_filt = ((acc_ref + 32768) >> 16) as u32;
-            let dis_filt = ((acc_dis + 32768) >> 16) as u32;
-            let rdi_filt = ((acc_rdi + 32768) >> 16) as u32;
-
-            // Compute variances/covariance in a wider signed type to avoid
-            // debug overflow when intermediate u32 values exceed i32::MAX.
-            let sigma1_sq = ref_filt as i64 - mu1_sq as i64;
-            let sigma2_sq = (dis_filt as i64 - mu2_sq as i64).max(0);
-            let sigma12 = rdi_filt as i64 - mu1_mu2 as i64;
-
-            // ── Step 3: VIF accumulator logic — spec §4.2.7 ──────────────────
-            if sigma1_sq >= SIGMA_NSQ as i64 {
-                let sigma1_u32 = sigma1_sq.min(u32::MAX as i64) as u32;
-
-                accum_den_log +=
-                    log2_32(&LOG2_TABLE, SIGMA_NSQ.saturating_add(sigma1_u32)) as i64 - 2048 * 17;
-
-                if sigma12 > 0 && sigma2_sq > 0 {
-                    let g = sigma12 as f64 / (sigma1_sq as f64 + EPSILON);
-
-                    // Clamp sv_sq in integer domain (not float) — spec §4.2.7
-                    let sv_sq = (sigma2_sq - (g * sigma12 as f64) as i64).max(0);
-
-                    let g = g.min(vif_enhn_gain_limit);
-
-                    let sv_u32 = sv_sq.min(u32::MAX as i64) as u32;
-                    let numer1 = sv_u32.saturating_add(SIGMA_NSQ);
-
-                    let numer1_tmp = (g * g * sigma1_sq as f64) as i64 + numer1 as i64;
-                    let numer1_tmp = numer1_tmp.max(numer1 as i64) as u64;
-
-                    accum_num_log += log2_64(&LOG2_TABLE, numer1_tmp) as i64
-                        - log2_64(&LOG2_TABLE, numer1 as u64) as i64;
-                }
-            } else {
-                accum_num_non_log += sigma2_sq;
-                accum_den_non_log += 1;
-            }
-        }
+    for k in 0..taps {
+        let ii = reflect_index(i as i32 - half as i32 + k as i32, height as i32);
+        row_offsets[k] = ii * width;
     }
 
-    // ── Step 4: Per-scale score extraction — spec §4.2.8 ──────────────────────
-    // Evaluate left-to-right; do not reorder the divisions.
-    let non_log_penalty = accum_num_non_log as f64 / 16384.0 / 65025.0;
-    let num = accum_num_log as f64 / 2048.0 + (accum_den_non_log as f64 - non_log_penalty);
-    let den = accum_den_log as f64 / 2048.0 + accum_den_non_log as f64;
+    row_offsets
+}
+
+#[inline]
+fn vertical_scalar_range_wrapping(
+    ref_plane: &[u16],
+    dis_plane: &[u16],
+    row_offsets: &[usize],
+    coeffs: &[u16],
+    shift_mu: u32,
+    round_mu: u32,
+    start: usize,
+    end: usize,
+    tmp_mu1: &mut [u16],
+    tmp_mu2: &mut [u16],
+    tmp_ref_sq: &mut [u32],
+    tmp_dis_sq: &mut [u32],
+    tmp_ref_dis: &mut [u32],
+) {
+    for j in start..end {
+        let mut acc_mu1 = 0u32;
+        let mut acc_mu2 = 0u32;
+        let mut acc_rsq = 0u32;
+        let mut acc_dsq = 0u32;
+        let mut acc_rdi = 0u32;
+
+        for (tap, &coeff) in coeffs.iter().enumerate() {
+            let idx = row_offsets[tap] + j;
+            let c = coeff as u32;
+            let r = ref_plane[idx] as u32;
+            let d = dis_plane[idx] as u32;
+            let cr = c * r;
+            let cd = c * d;
+            acc_mu1 += cr;
+            acc_mu2 += cd;
+            acc_rsq = acc_rsq.wrapping_add(cr * r);
+            acc_dsq = acc_dsq.wrapping_add(cd * d);
+            acc_rdi = acc_rdi.wrapping_add(cr * d);
+        }
+
+        tmp_mu1[j] = ((acc_mu1 + round_mu) >> shift_mu) as u16;
+        tmp_mu2[j] = ((acc_mu2 + round_mu) >> shift_mu) as u16;
+        tmp_ref_sq[j] = acc_rsq;
+        tmp_dis_sq[j] = acc_dsq;
+        tmp_ref_dis[j] = acc_rdi;
+    }
+}
+
+#[inline]
+fn vertical_scalar_range_non_wrapping(
+    ref_plane: &[u16],
+    dis_plane: &[u16],
+    row_offsets: &[usize],
+    coeffs: &[u16],
+    shift_mu: u32,
+    round_mu: u32,
+    sq_shift: u32,
+    sq_round64: u64,
+    start: usize,
+    end: usize,
+    tmp_mu1: &mut [u16],
+    tmp_mu2: &mut [u16],
+    tmp_ref_sq: &mut [u32],
+    tmp_dis_sq: &mut [u32],
+    tmp_ref_dis: &mut [u32],
+) {
+    for j in start..end {
+        let mut acc_mu1 = 0u32;
+        let mut acc_mu2 = 0u32;
+        let mut acc_rsq = 0u64;
+        let mut acc_dsq = 0u64;
+        let mut acc_rdi = 0u64;
+
+        for (tap, &coeff) in coeffs.iter().enumerate() {
+            let idx = row_offsets[tap] + j;
+            let c = coeff as u32;
+            let r = ref_plane[idx] as u32;
+            let d = dis_plane[idx] as u32;
+            let cr = c as u64 * r as u64;
+            let cd = c as u64 * d as u64;
+            acc_mu1 += c * r;
+            acc_mu2 += c * d;
+            acc_rsq += cr * r as u64;
+            acc_dsq += cd * d as u64;
+            acc_rdi += cr * d as u64;
+        }
+
+        tmp_mu1[j] = ((acc_mu1 + round_mu) >> shift_mu) as u16;
+        tmp_mu2[j] = ((acc_mu2 + round_mu) >> shift_mu) as u16;
+        tmp_ref_sq[j] = ((acc_rsq + sq_round64) >> sq_shift) as u32;
+        tmp_dis_sq[j] = ((acc_dsq + sq_round64) >> sq_shift) as u32;
+        tmp_ref_dis[j] = ((acc_rdi + sq_round64) >> sq_shift) as u32;
+    }
+}
+
+#[inline]
+fn horizontal_scalar_range(
+    tmp_mu1: &[u16],
+    tmp_mu2: &[u16],
+    tmp_ref_sq: &[u32],
+    tmp_dis_sq: &[u32],
+    tmp_ref_dis: &[u32],
+    coeffs: &[u16],
+    half: usize,
+    start: usize,
+    end: usize,
+    vif_enhn_gain_limit: f64,
+    accum: &mut RunningStatAccumulators,
+) {
+    let width = tmp_mu1.len();
+
+    for j in start..end {
+        let mut acc_mu1 = 0u32;
+        let mut acc_mu2 = 0u32;
+        let mut acc_ref = 0u64;
+        let mut acc_dis = 0u64;
+        let mut acc_rdi = 0u64;
+
+        for (tap, &coeff) in coeffs.iter().enumerate() {
+            let jj = reflect_index(j as i32 - half as i32 + tap as i32, width as i32);
+            let c = coeff as u32;
+            acc_mu1 += c * tmp_mu1[jj] as u32;
+            acc_mu2 += c * tmp_mu2[jj] as u32;
+            acc_ref += c as u64 * tmp_ref_sq[jj] as u64;
+            acc_dis += c as u64 * tmp_dis_sq[jj] as u64;
+            acc_rdi += c as u64 * tmp_ref_dis[jj] as u64;
+        }
+
+        process_filtered_pixel(
+            acc_mu1,
+            acc_mu2,
+            acc_ref,
+            acc_dis,
+            acc_rdi,
+            vif_enhn_gain_limit,
+            accum,
+        );
+    }
+}
+
+#[inline]
+fn horizontal_simd_body_range(width: usize, half: usize, lanes: usize) -> (usize, usize) {
+    let start = half.min(width);
+    let interior_end = width.saturating_sub(half);
+
+    if interior_end <= start {
+        return (start, start);
+    }
+
+    let simd_end = start + ((interior_end - start) / lanes) * lanes;
+    (start, simd_end)
+}
+
+#[inline]
+fn process_filtered_pixel(
+    acc_mu1: u32,
+    acc_mu2: u32,
+    acc_ref: u64,
+    acc_dis: u64,
+    acc_rdi: u64,
+    vif_enhn_gain_limit: f64,
+    accum: &mut RunningStatAccumulators,
+) {
+    let mu1_sq = ((acc_mu1 as u64 * acc_mu1 as u64 + 2147483648) >> 32) as u32;
+    let mu2_sq = ((acc_mu2 as u64 * acc_mu2 as u64 + 2147483648) >> 32) as u32;
+    let mu1_mu2 = ((acc_mu1 as u64 * acc_mu2 as u64 + 2147483648) >> 32) as u32;
+
+    let ref_filt = ((acc_ref + 32768) >> 16) as u32;
+    let dis_filt = ((acc_dis + 32768) >> 16) as u32;
+    let rdi_filt = ((acc_rdi + 32768) >> 16) as u32;
+
+    let sigma1_sq = ref_filt as i64 - mu1_sq as i64;
+    let sigma2_sq = (dis_filt as i64 - mu2_sq as i64).max(0);
+    let sigma12 = rdi_filt as i64 - mu1_mu2 as i64;
+
+    if sigma1_sq >= SIGMA_NSQ as i64 {
+        let sigma1_u32 = sigma1_sq.min(u32::MAX as i64) as u32;
+        accum.accum_den_log +=
+            log2_32(&LOG2_TABLE, SIGMA_NSQ.saturating_add(sigma1_u32)) as i64 - 2048 * 17;
+
+        if sigma12 > 0 && sigma2_sq > 0 {
+            let g = sigma12 as f64 / (sigma1_sq as f64 + EPSILON);
+            let sv_sq = (sigma2_sq - (g * sigma12 as f64) as i64).max(0);
+            let g = g.min(vif_enhn_gain_limit);
+
+            let sv_u32 = sv_sq.min(u32::MAX as i64) as u32;
+            let numer1 = sv_u32.saturating_add(SIGMA_NSQ);
+            let numer1_tmp = (g * g * sigma1_sq as f64) as i64 + numer1 as i64;
+            let numer1_tmp = numer1_tmp.max(numer1 as i64) as u64;
+
+            accum.accum_num_log += log2_64(&LOG2_TABLE, numer1_tmp) as i64
+                - log2_64(&LOG2_TABLE, numer1 as u64) as i64;
+        }
+    } else {
+        accum.accum_num_non_log += sigma2_sq;
+        accum.accum_den_non_log += 1;
+    }
+}
+
+#[inline]
+fn finalize_scale_stat(accum: RunningStatAccumulators) -> ScaleStat {
+    let non_log_penalty = accum.accum_num_non_log as f64 / 16384.0 / 65025.0;
+    let num =
+        accum.accum_num_log as f64 / 2048.0 + (accum.accum_den_non_log as f64 - non_log_penalty);
+    let den = accum.accum_den_log as f64 / 2048.0 + accum.accum_den_non_log as f64;
 
     ScaleStat { num, den }
 }

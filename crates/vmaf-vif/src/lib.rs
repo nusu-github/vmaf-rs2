@@ -18,12 +18,36 @@ mod tests {
     use super::extractor::VifExtractor;
     use super::filter::subsample;
     use super::math::{log2_32, log2_64, reflect_index};
+    use super::stat::vif_statistic;
     use super::tables::LOG2_TABLE;
+    use vmaf_cpu::SimdBackend;
+
+    fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    ((x * 19 + y * 23 + ((x ^ y) * 7) + (x * y * 3) + bias) % modulus as usize)
+                        as u16
+                })
+            })
+            .collect()
+    }
+
+    fn assert_scores_match(
+        expected: &super::extractor::VifScores,
+        actual: &super::extractor::VifScores,
+    ) {
+        for scale in 0..4 {
+            assert_eq!(
+                expected.scale[scale].to_bits(),
+                actual.scale[scale].to_bits()
+            );
+        }
+        assert_eq!(expected.combined.to_bits(), actual.combined.to_bits());
+    }
 
     // ── log2_table §8 conformance ─────────────────────────────────────────────
 
-    /// §8 conformance vectors for log2_table.
-    /// CRITICAL: must use f32 (not f64) log2 — spec §4.2.1.
     #[test]
     fn log2_table_reference_vectors() {
         assert_eq!(LOG2_TABLE[32768], 30720);
@@ -48,49 +72,45 @@ mod tests {
 
     #[test]
     fn reflect_index_overflow() {
-        assert_eq!(reflect_index(5, 5), 3); // 2*5 - 2 - 5 = 3
-        assert_eq!(reflect_index(6, 5), 2); // 2*5 - 2 - 6 = 2
+        assert_eq!(reflect_index(5, 5), 3);
+        assert_eq!(reflect_index(6, 5), 2);
     }
 
     // ── log2_32 ───────────────────────────────────────────────────────────────
 
-    /// log2_32 — spec §4.2.2
     #[test]
     fn log2_32_known_power_of_two() {
-        assert_eq!(log2_32(&LOG2_TABLE, 131072), 34816); // log2(2^17) * 2048 = 34816
-        assert_eq!(log2_32(&LOG2_TABLE, 262144), 36864); // log2(2^18) * 2048 = 36864
+        assert_eq!(log2_32(&LOG2_TABLE, 131072), 34816);
+        assert_eq!(log2_32(&LOG2_TABLE, 262144), 36864);
     }
 
     // ── log2_64 ───────────────────────────────────────────────────────────────
 
-    /// log2_64 — spec §4.2.3
     #[test]
     fn log2_64_known_power_of_two() {
         assert_eq!(log2_64(&LOG2_TABLE, 131072), 34816);
-        assert_eq!(log2_64(&LOG2_TABLE, 1 << 20), 40960); // log2(2^20) * 2048 = 40960
+        assert_eq!(log2_64(&LOG2_TABLE, 1 << 20), 40960);
     }
 
     // ── subsample ─────────────────────────────────────────────────────────────
 
-    /// Subsampled output must be half the input dimensions (integer division).
     #[test]
     fn subsample_halves_dimensions() {
         let w = 32;
         let h = 32;
         let frame = vec![128u16; w * h];
-        let (_, _, ow, oh) = subsample(&frame, &frame, w, h, 8, 0);
+        let (_, _, ow, oh) = subsample(&frame, &frame, w, h, 8, 0, SimdBackend::Scalar);
         assert_eq!(ow, 16);
         assert_eq!(oh, 16);
     }
 
-    /// Subsampling a uniform frame produces a uniform output (same value across all pixels).
     #[test]
     fn subsample_flat_produces_flat() {
         let w = 32;
         let h = 32;
         let ref_f = vec![128u16; w * h];
         let dis_f = vec![200u16; w * h];
-        let (out_r, out_d, _, _) = subsample(&ref_f, &dis_f, w, h, 8, 0);
+        let (out_r, out_d, _, _) = subsample(&ref_f, &dis_f, w, h, 8, 0, SimdBackend::Scalar);
         let v_r = out_r[0];
         let v_d = out_d[0];
         assert!(
@@ -105,18 +125,12 @@ mod tests {
 
     // ── VifExtractor ──────────────────────────────────────────────────────────
 
-    /// Identical flat frames → every scale score == 1.0.
-    ///
-    /// For constant frames: sigma1_sq = sigma2_sq = sigma12 = 0 for all pixels.
-    /// All pixels take the non-log path (sigma1_sq < SIGMA_NSQ).
-    /// non_log penalty = 0 / 16384 / 65025 = 0.
-    /// num = den = H*W → score = 1.0.
     #[test]
     fn vif_identical_flat_frames_score_one() {
         let w = 32;
         let h = 32;
         let frame = vec![128u16; w * h];
-        let ext = VifExtractor::new(w, h, 8, 100.0);
+        let ext = VifExtractor::with_backend(w, h, 8, 100.0, SimdBackend::Scalar);
         let s = ext.compute_frame(&frame, &frame);
         for sc in 0..4 {
             assert!(
@@ -128,17 +142,12 @@ mod tests {
         assert!((s.combined - 1.0).abs() < 1e-9, "combined: {}", s.combined);
     }
 
-    /// Identical non-flat frames → scores close to 1.0.
-    ///
-    /// For identical ref/dis: sigma12 = sigma1_sq and sigma2_sq = sigma1_sq.
-    /// The log-path gain g ≈ 1, sv_sq ≈ 0, numer1_tmp ≈ numer1 → num ≈ den.
     #[test]
     fn vif_identical_gradient_frames_score_near_one() {
         let w = 32;
         let h = 32;
-        // Horizontal ramp 0..=31, tiled across rows
         let frame: Vec<u16> = (0..h).flat_map(|_| 0u16..w as u16).collect();
-        let ext = VifExtractor::new(w, h, 8, 100.0);
+        let ext = VifExtractor::with_backend(w, h, 8, 100.0, SimdBackend::Scalar);
         let s = ext.compute_frame(&frame, &frame);
         for sc in 0..4 {
             assert!(s.scale[sc] >= 0.99, "scale {sc}: {}", s.scale[sc]);
@@ -149,5 +158,133 @@ mod tests {
             "combined: {}",
             s.combined
         );
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn subsample_detected_backend_matches_scalar() {
+        let backend = SimdBackend::detect();
+        if matches!(backend, SimdBackend::Scalar) {
+            return;
+        }
+
+        let w = 23;
+        let h = 19;
+        let ref_plane = patterned_plane(w, h, 1024, 11);
+        let dis_plane = patterned_plane(w, h, 1024, 97);
+        let scalar = subsample(&ref_plane, &dis_plane, w, h, 10, 0, SimdBackend::Scalar);
+        let simd = subsample(&ref_plane, &dis_plane, w, h, 10, 0, backend);
+        assert_eq!(scalar, simd);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn vif_statistic_detected_backend_matches_scalar_non_wrapping_scale0() {
+        let backend = SimdBackend::detect();
+        if matches!(backend, SimdBackend::Scalar) {
+            return;
+        }
+
+        let w = 21;
+        let h = 17;
+        let ref_plane = patterned_plane(w, h, 1024, 19);
+        let dis_plane = patterned_plane(w, h, 1024, 41);
+        let scalar = vif_statistic(
+            &ref_plane,
+            &dis_plane,
+            w,
+            h,
+            10,
+            0,
+            100.0,
+            SimdBackend::Scalar,
+        );
+        let simd = vif_statistic(&ref_plane, &dis_plane, w, h, 10, 0, 100.0, backend);
+        assert_eq!(scalar.num.to_bits(), simd.num.to_bits());
+        assert_eq!(scalar.den.to_bits(), simd.den.to_bits());
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn vif_statistic_detected_backend_matches_scalar_wrapping_scale0() {
+        let backend = SimdBackend::detect();
+        if matches!(backend, SimdBackend::Scalar) {
+            return;
+        }
+
+        let w = 27;
+        let h = 17;
+        let ref_plane = patterned_plane(w, h, 256, 5);
+        let dis_plane = patterned_plane(w, h, 256, 133);
+        let scalar = vif_statistic(
+            &ref_plane,
+            &dis_plane,
+            w,
+            h,
+            8,
+            0,
+            100.0,
+            SimdBackend::Scalar,
+        );
+        let simd = vif_statistic(&ref_plane, &dis_plane, w, h, 8, 0, 100.0, backend);
+        assert_eq!(scalar.num.to_bits(), simd.num.to_bits());
+        assert_eq!(scalar.den.to_bits(), simd.den.to_bits());
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn extractor_detected_backend_matches_scalar() {
+        let backend = SimdBackend::detect();
+        if matches!(backend, SimdBackend::Scalar) {
+            return;
+        }
+
+        let w = 46;
+        let h = 38;
+        let ref_plane = patterned_plane(w, h, 1024, 3);
+        let dis_plane = patterned_plane(w, h, 1024, 67);
+        let scalar = VifExtractor::with_backend(w, h, 10, 100.0, SimdBackend::Scalar);
+        let simd = VifExtractor::with_backend(w, h, 10, 100.0, backend);
+        let scalar_scores = scalar.compute_frame(&ref_plane, &dis_plane);
+        let simd_scores = simd.compute_frame(&ref_plane, &dis_plane);
+        assert_scores_match(&scalar_scores, &simd_scores);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn extractor_explicit_backends_match_scalar_on_odd_12bit_pyramid() {
+        let w = 19usize;
+        let h = 17usize;
+        let bpc = 12u8;
+        let modulus = 1usize << bpc;
+        let len = w * h;
+        let mut ref_storage = vec![0u16; len + 3];
+        let mut dis_storage = vec![0u16; len + 5];
+        let ref_plane = &mut ref_storage[1..1 + len];
+        let dis_plane = &mut dis_storage[3..3 + len];
+
+        for y in 0..h {
+            for x in 0..w {
+                let idx = y * w + x;
+                let reference =
+                    (x * 37 + y * 61 + ((x ^ y) * 17) + (x * y * 5) + idx * 3) % modulus;
+                let delta = ((x * 11 + y * 7 + idx * 13) % 43) as u16;
+                ref_plane[idx] = reference as u16;
+                dis_plane[idx] = (reference as u16).saturating_sub(delta);
+            }
+        }
+
+        let scalar = VifExtractor::with_backend(w, h, bpc, 100.0, SimdBackend::Scalar);
+        let expected = scalar.compute_frame(ref_plane, dis_plane);
+
+        for backend in [SimdBackend::X86Sse2, SimdBackend::X86Avx2Fma] {
+            if !backend.is_available() {
+                continue;
+            }
+
+            let simd = VifExtractor::with_backend(w, h, bpc, 100.0, backend);
+            let actual = simd.compute_frame(ref_plane, dis_plane);
+            assert_scores_match(&expected, &actual);
+        }
     }
 }
