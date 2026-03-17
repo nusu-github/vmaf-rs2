@@ -3,6 +3,7 @@ use crate::dwt::{
     FILTER_HI, FILTER_LO, SCALE_PARAMS,
 };
 use crate::math::reflect_index;
+use std::mem::MaybeUninit;
 use vmaf_cpu::{Align32, AlignedScratch};
 
 #[cfg(target_arch = "x86")]
@@ -18,38 +19,45 @@ fn scale0_params(bpc: u8) -> (u32, i32) {
 }
 
 #[inline]
-fn write_i32_as_i16<const N: usize>(dst: &mut [i16], start: usize, values: [i32; N]) {
+fn write_i32_as_i16_uninit<const N: usize>(
+    dst: &mut [MaybeUninit<i16>],
+    start: usize,
+    values: [i32; N],
+) {
     for (lane, value) in values.into_iter().enumerate() {
-        dst[start + lane] = value as i16;
+        dst[start + lane].write(value as i16);
     }
 }
 
 #[inline]
-fn write_i64_as_i32<const N: usize>(dst: &mut [i32], start: usize, values: [i64; N]) {
-    for (lane, value) in values.into_iter().enumerate() {
-        dst[start + lane] = value as i32;
-    }
-}
-
-#[inline]
-fn write_i64_pairs_as_i32<const N: usize>(
-    dst: &mut [i32],
+fn write_i64_pairs_as_i32_uninit<const N: usize>(
+    dst: &mut [MaybeUninit<i32>],
     start: usize,
     even: [i64; N],
     odd: [i64; N],
 ) {
     for lane in 0..N {
-        dst[start + lane * 2] = even[lane] as i32;
-        dst[start + lane * 2 + 1] = odd[lane] as i32;
+        dst[start + lane * 2].write(even[lane] as i32);
+        dst[start + lane * 2 + 1].write(odd[lane] as i32);
     }
+}
+
+#[inline]
+fn push_i32_as_i16<const N: usize>(dst: &mut Vec<i16>, values: [i32; N]) {
+    dst.extend(values.into_iter().map(|value| value as i16));
+}
+
+#[inline]
+fn push_i64_as_i32<const N: usize>(dst: &mut Vec<i32>, values: [i64; N]) {
+    dst.extend(values.into_iter().map(|value| value as i32));
 }
 
 pub(crate) fn dwt_scale0_sse2(src: &[u16], width: usize, height: usize, bpc: u8) -> Bands16 {
     let (shift_vp, round_vp) = scale0_params(bpc);
     let h_half = height.div_ceil(2);
     let w_half = width.div_ceil(2);
-    let mut tmplo = AlignedScratch::<i16, Align32>::zeroed(h_half * width);
-    let mut tmphi = AlignedScratch::<i16, Align32>::zeroed(h_half * width);
+    let mut tmplo = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
+    let mut tmphi = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
 
     {
         let tmplo = tmplo.as_mut_slice();
@@ -73,28 +81,30 @@ pub(crate) fn dwt_scale0_sse2(src: &[u16], width: usize, height: usize, bpc: u8)
         }
     }
 
-    let mut band_a = vec![0i16; h_half * w_half];
-    let mut band_v = vec![0i16; h_half * w_half];
-    let mut band_h = vec![0i16; h_half * w_half];
-    let mut band_d = vec![0i16; h_half * w_half];
+    // SAFETY: every temporary slot is written by the vertical pass above.
+    let tmplo = unsafe { tmplo.assume_init() };
+    // SAFETY: every temporary slot is written by the vertical pass above.
+    let tmphi = unsafe { tmphi.assume_init() };
+    let mut band_a = Vec::with_capacity(h_half * w_half);
+    let mut band_v = Vec::with_capacity(h_half * w_half);
+    let mut band_h = Vec::with_capacity(h_half * w_half);
+    let mut band_d = Vec::with_capacity(h_half * w_half);
     let tmplo = tmplo.as_slice();
     let tmphi = tmphi.as_slice();
 
     for i in 0..h_half {
         let src_row_start = i * width;
         let src_row_end = src_row_start + width;
-        let dst_row_start = i * w_half;
-        let dst_row_end = dst_row_start + w_half;
         // SAFETY: the dispatcher only selects this kernel when SSE2 is available.
         unsafe {
             dwt_scale0_horizontal_row_sse2(
                 &tmplo[src_row_start..src_row_end],
                 &tmphi[src_row_start..src_row_end],
                 width,
-                &mut band_a[dst_row_start..dst_row_end],
-                &mut band_v[dst_row_start..dst_row_end],
-                &mut band_h[dst_row_start..dst_row_end],
-                &mut band_d[dst_row_start..dst_row_end],
+                &mut band_a,
+                &mut band_v,
+                &mut band_h,
+                &mut band_d,
             );
         }
     }
@@ -113,8 +123,8 @@ pub(crate) fn dwt_scale0_avx2(src: &[u16], width: usize, height: usize, bpc: u8)
     let (shift_vp, round_vp) = scale0_params(bpc);
     let h_half = height.div_ceil(2);
     let w_half = width.div_ceil(2);
-    let mut tmplo = AlignedScratch::<i16, Align32>::zeroed(h_half * width);
-    let mut tmphi = AlignedScratch::<i16, Align32>::zeroed(h_half * width);
+    let mut tmplo = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
+    let mut tmphi = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
 
     {
         let tmplo = tmplo.as_mut_slice();
@@ -138,28 +148,30 @@ pub(crate) fn dwt_scale0_avx2(src: &[u16], width: usize, height: usize, bpc: u8)
         }
     }
 
-    let mut band_a = vec![0i16; h_half * w_half];
-    let mut band_v = vec![0i16; h_half * w_half];
-    let mut band_h = vec![0i16; h_half * w_half];
-    let mut band_d = vec![0i16; h_half * w_half];
+    // SAFETY: every temporary slot is written by the vertical pass above.
+    let tmplo = unsafe { tmplo.assume_init() };
+    // SAFETY: every temporary slot is written by the vertical pass above.
+    let tmphi = unsafe { tmphi.assume_init() };
+    let mut band_a = Vec::with_capacity(h_half * w_half);
+    let mut band_v = Vec::with_capacity(h_half * w_half);
+    let mut band_h = Vec::with_capacity(h_half * w_half);
+    let mut band_d = Vec::with_capacity(h_half * w_half);
     let tmplo = tmplo.as_slice();
     let tmphi = tmphi.as_slice();
 
     for i in 0..h_half {
         let src_row_start = i * width;
         let src_row_end = src_row_start + width;
-        let dst_row_start = i * w_half;
-        let dst_row_end = dst_row_start + w_half;
         // SAFETY: the dispatcher only selects this kernel when AVX2 is available.
         unsafe {
             dwt_scale0_horizontal_row_avx2(
                 &tmplo[src_row_start..src_row_end],
                 &tmphi[src_row_start..src_row_end],
                 width,
-                &mut band_a[dst_row_start..dst_row_end],
-                &mut band_v[dst_row_start..dst_row_end],
-                &mut band_h[dst_row_start..dst_row_end],
-                &mut band_d[dst_row_start..dst_row_end],
+                &mut band_a,
+                &mut band_v,
+                &mut band_h,
+                &mut band_d,
             );
         }
     }
@@ -178,8 +190,8 @@ pub(crate) fn dwt_s123_avx2(ll: &[i32], width: usize, height: usize, scale: usiz
     let (round_vp, shift_vp, round_hp, shift_hp) = SCALE_PARAMS[scale];
     let h_half = height.div_ceil(2);
     let w_half = width.div_ceil(2);
-    let mut tmplo = AlignedScratch::<i32, Align32>::zeroed(h_half * width);
-    let mut tmphi = AlignedScratch::<i32, Align32>::zeroed(h_half * width);
+    let mut tmplo = AlignedScratch::<MaybeUninit<i32>, Align32>::uninit(h_half * width);
+    let mut tmphi = AlignedScratch::<MaybeUninit<i32>, Align32>::uninit(h_half * width);
 
     {
         let tmplo = tmplo.as_mut_slice();
@@ -203,18 +215,20 @@ pub(crate) fn dwt_s123_avx2(ll: &[i32], width: usize, height: usize, scale: usiz
         }
     }
 
-    let mut band_a = vec![0i32; h_half * w_half];
-    let mut band_v = vec![0i32; h_half * w_half];
-    let mut band_h = vec![0i32; h_half * w_half];
-    let mut band_d = vec![0i32; h_half * w_half];
+    // SAFETY: every temporary slot is written by the vertical pass above.
+    let tmplo = unsafe { tmplo.assume_init() };
+    // SAFETY: every temporary slot is written by the vertical pass above.
+    let tmphi = unsafe { tmphi.assume_init() };
+    let mut band_a = Vec::with_capacity(h_half * w_half);
+    let mut band_v = Vec::with_capacity(h_half * w_half);
+    let mut band_h = Vec::with_capacity(h_half * w_half);
+    let mut band_d = Vec::with_capacity(h_half * w_half);
     let tmplo = tmplo.as_slice();
     let tmphi = tmphi.as_slice();
 
     for i in 0..h_half {
         let src_row_start = i * width;
         let src_row_end = src_row_start + width;
-        let dst_row_start = i * w_half;
-        let dst_row_end = dst_row_start + w_half;
         // SAFETY: the dispatcher only selects this kernel when AVX2 is available.
         unsafe {
             dwt_s123_horizontal_row_avx2(
@@ -223,10 +237,10 @@ pub(crate) fn dwt_s123_avx2(ll: &[i32], width: usize, height: usize, scale: usiz
                 width,
                 round_hp,
                 shift_hp,
-                &mut band_a[dst_row_start..dst_row_end],
-                &mut band_v[dst_row_start..dst_row_end],
-                &mut band_h[dst_row_start..dst_row_end],
-                &mut band_d[dst_row_start..dst_row_end],
+                &mut band_a,
+                &mut band_v,
+                &mut band_h,
+                &mut band_d,
             );
         }
     }
@@ -264,8 +278,8 @@ unsafe fn dwt_scale0_vertical_row_sse2(
     i: usize,
     shift_vp: u32,
     round_vp: i32,
-    tmplo_row: &mut [i16],
-    tmphi_row: &mut [i16],
+    tmplo_row: &mut [MaybeUninit<i16>],
+    tmphi_row: &mut [MaybeUninit<i16>],
 ) {
     debug_assert_eq!(tmplo_row.len(), width);
     debug_assert_eq!(tmphi_row.len(), width);
@@ -336,10 +350,10 @@ unsafe fn dwt_scale0_vertical_row_sse2(
         _mm_storeu_si128(al_buf_hi.as_mut_ptr() as *mut __m128i, al_hi);
         _mm_storeu_si128(ah_buf_lo.as_mut_ptr() as *mut __m128i, ah_lo);
         _mm_storeu_si128(ah_buf_hi.as_mut_ptr() as *mut __m128i, ah_hi);
-        write_i32_as_i16(tmplo_row, j, al_buf_lo);
-        write_i32_as_i16(tmplo_row, j + 4, al_buf_hi);
-        write_i32_as_i16(tmphi_row, j, ah_buf_lo);
-        write_i32_as_i16(tmphi_row, j + 4, ah_buf_hi);
+        write_i32_as_i16_uninit(tmplo_row, j, al_buf_lo);
+        write_i32_as_i16_uninit(tmplo_row, j + 4, al_buf_hi);
+        write_i32_as_i16_uninit(tmphi_row, j, ah_buf_lo);
+        write_i32_as_i16_uninit(tmphi_row, j + 4, ah_buf_hi);
         j += 8;
     }
 
@@ -359,8 +373,12 @@ unsafe fn dwt_scale0_vertical_row_sse2(
             .wrapping_add(FILTER_HI[1].wrapping_mul(s1))
             .wrapping_add(FILTER_HI[2].wrapping_mul(s2))
             .wrapping_add(FILTER_HI[3].wrapping_mul(s3));
-        *tmplo_row.get_unchecked_mut(j) = (al.wrapping_add(lo_bias_scalar) >> shift_vp) as i16;
-        *tmphi_row.get_unchecked_mut(j) = (ah.wrapping_add(round_vp) >> shift_vp) as i16;
+        tmplo_row
+            .get_unchecked_mut(j)
+            .write((al.wrapping_add(lo_bias_scalar) >> shift_vp) as i16);
+        tmphi_row
+            .get_unchecked_mut(j)
+            .write((ah.wrapping_add(round_vp) >> shift_vp) as i16);
         j += 1;
     }
 }
@@ -370,15 +388,12 @@ unsafe fn dwt_scale0_horizontal_row_sse2(
     tmplo_row: &[i16],
     tmphi_row: &[i16],
     width: usize,
-    band_a_row: &mut [i16],
-    band_v_row: &mut [i16],
-    band_h_row: &mut [i16],
-    band_d_row: &mut [i16],
+    band_a_row: &mut Vec<i16>,
+    band_v_row: &mut Vec<i16>,
+    band_h_row: &mut Vec<i16>,
+    band_d_row: &mut Vec<i16>,
 ) {
-    let w_half = band_a_row.len();
-    debug_assert_eq!(band_v_row.len(), w_half);
-    debug_assert_eq!(band_h_row.len(), w_half);
-    debug_assert_eq!(band_d_row.len(), w_half);
+    let w_half = width.div_ceil(2);
 
     let lo01 = _mm_setr_epi16(
         FILTER_LO[0] as i16,
@@ -425,10 +440,10 @@ unsafe fn dwt_scale0_horizontal_row_sse2(
 
     if j < w_half {
         let (a, v, h, d) = dwt_scale0_horizontal_scalar_at(tmplo_row, tmphi_row, width, j);
-        band_a_row[j] = a;
-        band_v_row[j] = v;
-        band_h_row[j] = h;
-        band_d_row[j] = d;
+        band_a_row.push(a);
+        band_v_row.push(v);
+        band_h_row.push(h);
+        band_d_row.push(d);
         j += 1;
     }
 
@@ -487,19 +502,19 @@ unsafe fn dwt_scale0_horizontal_row_sse2(
         _mm_storeu_si128(v_buf.as_mut_ptr() as *mut __m128i, band_v);
         _mm_storeu_si128(h_buf.as_mut_ptr() as *mut __m128i, band_h);
         _mm_storeu_si128(d_buf.as_mut_ptr() as *mut __m128i, band_d);
-        write_i32_as_i16(band_a_row, j, a_buf);
-        write_i32_as_i16(band_v_row, j, v_buf);
-        write_i32_as_i16(band_h_row, j, h_buf);
-        write_i32_as_i16(band_d_row, j, d_buf);
+        push_i32_as_i16(band_a_row, a_buf);
+        push_i32_as_i16(band_v_row, v_buf);
+        push_i32_as_i16(band_h_row, h_buf);
+        push_i32_as_i16(band_d_row, d_buf);
         j += 4;
     }
 
     while j < w_half {
         let (a, v, h, d) = dwt_scale0_horizontal_scalar_at(tmplo_row, tmphi_row, width, j);
-        band_a_row[j] = a;
-        band_v_row[j] = v;
-        band_h_row[j] = h;
-        band_d_row[j] = d;
+        band_a_row.push(a);
+        band_v_row.push(v);
+        band_h_row.push(h);
+        band_d_row.push(d);
         j += 1;
     }
 }
@@ -512,8 +527,8 @@ unsafe fn dwt_scale0_vertical_row_avx2(
     i: usize,
     shift_vp: u32,
     round_vp: i32,
-    tmplo_row: &mut [i16],
-    tmphi_row: &mut [i16],
+    tmplo_row: &mut [MaybeUninit<i16>],
+    tmphi_row: &mut [MaybeUninit<i16>],
 ) {
     debug_assert_eq!(tmplo_row.len(), width);
     debug_assert_eq!(tmphi_row.len(), width);
@@ -629,10 +644,10 @@ unsafe fn dwt_scale0_vertical_row_avx2(
         _mm256_storeu_si256(al_buf_hi.as_mut_ptr() as *mut __m256i, al_hi);
         _mm256_storeu_si256(ah_buf_lo.as_mut_ptr() as *mut __m256i, ah_lo);
         _mm256_storeu_si256(ah_buf_hi.as_mut_ptr() as *mut __m256i, ah_hi);
-        write_i32_as_i16(tmplo_row, j, al_buf_lo);
-        write_i32_as_i16(tmplo_row, j + 8, al_buf_hi);
-        write_i32_as_i16(tmphi_row, j, ah_buf_lo);
-        write_i32_as_i16(tmphi_row, j + 8, ah_buf_hi);
+        write_i32_as_i16_uninit(tmplo_row, j, al_buf_lo);
+        write_i32_as_i16_uninit(tmplo_row, j + 8, al_buf_hi);
+        write_i32_as_i16_uninit(tmphi_row, j, ah_buf_lo);
+        write_i32_as_i16_uninit(tmphi_row, j + 8, ah_buf_hi);
         j += 16;
     }
 
@@ -652,8 +667,12 @@ unsafe fn dwt_scale0_vertical_row_avx2(
             .wrapping_add(FILTER_HI[1].wrapping_mul(s1))
             .wrapping_add(FILTER_HI[2].wrapping_mul(s2))
             .wrapping_add(FILTER_HI[3].wrapping_mul(s3));
-        *tmplo_row.get_unchecked_mut(j) = (al.wrapping_add(lo_bias_scalar) >> shift_vp) as i16;
-        *tmphi_row.get_unchecked_mut(j) = (ah.wrapping_add(round_vp) >> shift_vp) as i16;
+        tmplo_row
+            .get_unchecked_mut(j)
+            .write((al.wrapping_add(lo_bias_scalar) >> shift_vp) as i16);
+        tmphi_row
+            .get_unchecked_mut(j)
+            .write((ah.wrapping_add(round_vp) >> shift_vp) as i16);
         j += 1;
     }
 }
@@ -663,15 +682,12 @@ unsafe fn dwt_scale0_horizontal_row_avx2(
     tmplo_row: &[i16],
     tmphi_row: &[i16],
     width: usize,
-    band_a_row: &mut [i16],
-    band_v_row: &mut [i16],
-    band_h_row: &mut [i16],
-    band_d_row: &mut [i16],
+    band_a_row: &mut Vec<i16>,
+    band_v_row: &mut Vec<i16>,
+    band_h_row: &mut Vec<i16>,
+    band_d_row: &mut Vec<i16>,
 ) {
-    let w_half = band_a_row.len();
-    debug_assert_eq!(band_v_row.len(), w_half);
-    debug_assert_eq!(band_h_row.len(), w_half);
-    debug_assert_eq!(band_d_row.len(), w_half);
+    let w_half = width.div_ceil(2);
 
     let lo01 = _mm256_setr_epi16(
         FILTER_LO[0] as i16,
@@ -750,10 +766,10 @@ unsafe fn dwt_scale0_horizontal_row_avx2(
 
     if j < w_half {
         let (a, v, h, d) = dwt_scale0_horizontal_scalar_at(tmplo_row, tmphi_row, width, j);
-        band_a_row[j] = a;
-        band_v_row[j] = v;
-        band_h_row[j] = h;
-        band_d_row[j] = d;
+        band_a_row.push(a);
+        band_v_row.push(v);
+        band_h_row.push(h);
+        band_d_row.push(d);
         j += 1;
     }
 
@@ -812,19 +828,19 @@ unsafe fn dwt_scale0_horizontal_row_avx2(
         _mm256_storeu_si256(v_buf.as_mut_ptr() as *mut __m256i, band_v);
         _mm256_storeu_si256(h_buf.as_mut_ptr() as *mut __m256i, band_h);
         _mm256_storeu_si256(d_buf.as_mut_ptr() as *mut __m256i, band_d);
-        write_i32_as_i16(band_a_row, j, a_buf);
-        write_i32_as_i16(band_v_row, j, v_buf);
-        write_i32_as_i16(band_h_row, j, h_buf);
-        write_i32_as_i16(band_d_row, j, d_buf);
+        push_i32_as_i16(band_a_row, a_buf);
+        push_i32_as_i16(band_v_row, v_buf);
+        push_i32_as_i16(band_h_row, h_buf);
+        push_i32_as_i16(band_d_row, d_buf);
         j += 8;
     }
 
     while j < w_half {
         let (a, v, h, d) = dwt_scale0_horizontal_scalar_at(tmplo_row, tmphi_row, width, j);
-        band_a_row[j] = a;
-        band_v_row[j] = v;
-        band_h_row[j] = h;
-        band_d_row[j] = d;
+        band_a_row.push(a);
+        band_v_row.push(v);
+        band_h_row.push(h);
+        band_d_row.push(d);
         j += 1;
     }
 }
@@ -874,8 +890,8 @@ unsafe fn dwt_s123_vertical_row_avx2(
     i: usize,
     round_vp: i64,
     shift_vp: u32,
-    tmplo_row: &mut [i32],
-    tmphi_row: &mut [i32],
+    tmplo_row: &mut [MaybeUninit<i32>],
+    tmphi_row: &mut [MaybeUninit<i32>],
 ) {
     debug_assert_eq!(tmplo_row.len(), width);
     debug_assert_eq!(tmphi_row.len(), width);
@@ -956,8 +972,8 @@ unsafe fn dwt_s123_vertical_row_avx2(
         _mm256_storeu_si256(al_odd_buf.as_mut_ptr() as *mut __m256i, al_odd);
         _mm256_storeu_si256(ah_even_buf.as_mut_ptr() as *mut __m256i, ah_even);
         _mm256_storeu_si256(ah_odd_buf.as_mut_ptr() as *mut __m256i, ah_odd);
-        write_i64_pairs_as_i32(tmplo_row, j, al_even_buf, al_odd_buf);
-        write_i64_pairs_as_i32(tmphi_row, j, ah_even_buf, ah_odd_buf);
+        write_i64_pairs_as_i32_uninit(tmplo_row, j, al_even_buf, al_odd_buf);
+        write_i64_pairs_as_i32_uninit(tmphi_row, j, ah_even_buf, ah_odd_buf);
         j += 8;
     }
 
@@ -974,8 +990,12 @@ unsafe fn dwt_s123_vertical_row_avx2(
             + FILTER_HI[1] as i64 * s1
             + FILTER_HI[2] as i64 * s2
             + FILTER_HI[3] as i64 * s3;
-        *tmplo_row.get_unchecked_mut(j) = ((al + round_vp) >> shift_vp) as i32;
-        *tmphi_row.get_unchecked_mut(j) = ((ah + round_vp) >> shift_vp) as i32;
+        tmplo_row
+            .get_unchecked_mut(j)
+            .write(((al + round_vp) >> shift_vp) as i32);
+        tmphi_row
+            .get_unchecked_mut(j)
+            .write(((ah + round_vp) >> shift_vp) as i32);
         j += 1;
     }
 }
@@ -987,15 +1007,12 @@ unsafe fn dwt_s123_horizontal_row_avx2(
     width: usize,
     round_hp: i64,
     shift_hp: u32,
-    band_a_row: &mut [i32],
-    band_v_row: &mut [i32],
-    band_h_row: &mut [i32],
-    band_d_row: &mut [i32],
+    band_a_row: &mut Vec<i32>,
+    band_v_row: &mut Vec<i32>,
+    band_h_row: &mut Vec<i32>,
+    band_d_row: &mut Vec<i32>,
 ) {
-    let w_half = band_a_row.len();
-    debug_assert_eq!(band_v_row.len(), w_half);
-    debug_assert_eq!(band_h_row.len(), w_half);
-    debug_assert_eq!(band_d_row.len(), w_half);
+    let w_half = width.div_ceil(2);
 
     let round = _mm256_set1_epi64x(round_hp);
     let mut j = 0;
@@ -1003,10 +1020,10 @@ unsafe fn dwt_s123_horizontal_row_avx2(
     if j < w_half {
         let (a, v, h, d) =
             dwt_s123_horizontal_scalar_at(tmplo_row, tmphi_row, width, j, round_hp, shift_hp);
-        band_a_row[j] = a;
-        band_v_row[j] = v;
-        band_h_row[j] = h;
-        band_d_row[j] = d;
+        band_a_row.push(a);
+        band_v_row.push(v);
+        band_h_row.push(h);
+        band_d_row.push(d);
         j += 1;
     }
 
@@ -1065,20 +1082,20 @@ unsafe fn dwt_s123_horizontal_row_avx2(
         _mm256_storeu_si256(v_buf.as_mut_ptr() as *mut __m256i, band_v);
         _mm256_storeu_si256(h_buf.as_mut_ptr() as *mut __m256i, band_h);
         _mm256_storeu_si256(d_buf.as_mut_ptr() as *mut __m256i, band_d);
-        write_i64_as_i32(band_a_row, j, a_buf);
-        write_i64_as_i32(band_v_row, j, v_buf);
-        write_i64_as_i32(band_h_row, j, h_buf);
-        write_i64_as_i32(band_d_row, j, d_buf);
+        push_i64_as_i32(band_a_row, a_buf);
+        push_i64_as_i32(band_v_row, v_buf);
+        push_i64_as_i32(band_h_row, h_buf);
+        push_i64_as_i32(band_d_row, d_buf);
         j += 4;
     }
 
     while j < w_half {
         let (a, v, h, d) =
             dwt_s123_horizontal_scalar_at(tmplo_row, tmphi_row, width, j, round_hp, shift_hp);
-        band_a_row[j] = a;
-        band_v_row[j] = v;
-        band_h_row[j] = h;
-        band_d_row[j] = d;
+        band_a_row.push(a);
+        band_v_row.push(v);
+        band_h_row.push(h);
+        band_d_row.push(d);
         j += 1;
     }
 }

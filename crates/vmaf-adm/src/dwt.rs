@@ -1,5 +1,7 @@
 //! DWT filter constants and 2D computation — spec §4.3.1–4.3.3
 
+use std::mem::MaybeUninit;
+
 use crate::math::reflect_index;
 use vmaf_cpu::{Align32, AlignedScratch};
 
@@ -41,8 +43,8 @@ pub(crate) struct Bands32 {
 /// 2D DWT on a uint16 luma plane (scale 0, int16 output) — spec §4.3.3.
 pub(crate) fn dwt_scale0(src: &[u16], width: usize, height: usize, bpc: u8) -> Bands16 {
     let h_half = height.div_ceil(2);
-    let mut tmplo = AlignedScratch::<i16, Align32>::zeroed(h_half * width);
-    let mut tmphi = AlignedScratch::<i16, Align32>::zeroed(h_half * width);
+    let mut tmplo = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
+    let mut tmphi = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
 
     dwt_scale0_vertical_scalar(
         src,
@@ -52,6 +54,10 @@ pub(crate) fn dwt_scale0(src: &[u16], width: usize, height: usize, bpc: u8) -> B
         tmplo.as_mut_slice(),
         tmphi.as_mut_slice(),
     );
+    // SAFETY: `dwt_scale0_vertical_scalar` writes every temporary coefficient.
+    let tmplo = unsafe { tmplo.assume_init() };
+    // SAFETY: `dwt_scale0_vertical_scalar` writes every temporary coefficient.
+    let tmphi = unsafe { tmphi.assume_init() };
     dwt_scale0_horizontal_scalar(tmplo.as_slice(), tmphi.as_slice(), width, h_half)
 }
 
@@ -60,8 +66,8 @@ pub(crate) fn dwt_scale0_vertical_scalar(
     width: usize,
     height: usize,
     bpc: u8,
-    tmplo: &mut [i16],
-    tmphi: &mut [i16],
+    tmplo: &mut [MaybeUninit<i16>],
+    tmphi: &mut [MaybeUninit<i16>],
 ) {
     let shift_vp = if bpc == 8 { 8u32 } else { bpc as u32 };
     let round_vp = 1i32 << (shift_vp - 1);
@@ -97,8 +103,8 @@ pub(crate) fn dwt_scale0_vertical_scalar(
                 .wrapping_add(FILTER_HI[2].wrapping_mul(s2))
                 .wrapping_add(FILTER_HI[3].wrapping_mul(s3));
 
-            tmplo[row_offset + j] = (al.wrapping_add(lo_bias) >> shift_vp) as i16;
-            tmphi[row_offset + j] = (ah.wrapping_add(round_vp) >> shift_vp) as i16;
+            tmplo[row_offset + j].write((al.wrapping_add(lo_bias) >> shift_vp) as i16);
+            tmphi[row_offset + j].write((ah.wrapping_add(round_vp) >> shift_vp) as i16);
         }
     }
 }
@@ -145,10 +151,11 @@ pub(crate) fn dwt_scale0_horizontal_scalar(
     h_half: usize,
 ) -> Bands16 {
     let w_half = width.div_ceil(2);
-    let mut band_a = vec![0i16; h_half * w_half];
-    let mut band_v = vec![0i16; h_half * w_half];
-    let mut band_h = vec![0i16; h_half * w_half];
-    let mut band_d = vec![0i16; h_half * w_half];
+    let n = h_half * w_half;
+    let mut band_a = Vec::with_capacity(n);
+    let mut band_v = Vec::with_capacity(n);
+    let mut band_h = Vec::with_capacity(n);
+    let mut band_d = Vec::with_capacity(n);
 
     debug_assert_eq!(tmplo.len(), h_half * width);
     debug_assert_eq!(tmphi.len(), h_half * width);
@@ -156,21 +163,15 @@ pub(crate) fn dwt_scale0_horizontal_scalar(
     for i in 0..h_half {
         let src_row_start = i * width;
         let src_row_end = src_row_start + width;
-        let dst_row_start = i * w_half;
-        let dst_row_end = dst_row_start + w_half;
         let tmplo_row = &tmplo[src_row_start..src_row_end];
         let tmphi_row = &tmphi[src_row_start..src_row_end];
-        let band_a_row = &mut band_a[dst_row_start..dst_row_end];
-        let band_v_row = &mut band_v[dst_row_start..dst_row_end];
-        let band_h_row = &mut band_h[dst_row_start..dst_row_end];
-        let band_d_row = &mut band_d[dst_row_start..dst_row_end];
 
         for j in 0..w_half {
             let (a, v, h, d) = dwt_scale0_horizontal_scalar_at(tmplo_row, tmphi_row, width, j);
-            band_a_row[j] = a;
-            band_v_row[j] = v;
-            band_h_row[j] = h;
-            band_d_row[j] = d;
+            band_a.push(a);
+            band_v.push(v);
+            band_h.push(h);
+            band_d.push(d);
         }
     }
 
@@ -195,8 +196,8 @@ pub(crate) const SCALE_PARAMS: [(i64, u32, i64, u32); 4] = [
 /// 2D DWT on an int32 LL band (scales 1–3, int32 output) — spec §4.3.3.
 pub(crate) fn dwt_s123(ll: &[i32], width: usize, height: usize, scale: usize) -> Bands32 {
     let h_half = height.div_ceil(2);
-    let mut tmplo = AlignedScratch::<i32, Align32>::zeroed(h_half * width);
-    let mut tmphi = AlignedScratch::<i32, Align32>::zeroed(h_half * width);
+    let mut tmplo = AlignedScratch::<MaybeUninit<i32>, Align32>::uninit(h_half * width);
+    let mut tmphi = AlignedScratch::<MaybeUninit<i32>, Align32>::uninit(h_half * width);
 
     dwt_s123_vertical_scalar(
         ll,
@@ -206,6 +207,10 @@ pub(crate) fn dwt_s123(ll: &[i32], width: usize, height: usize, scale: usize) ->
         tmplo.as_mut_slice(),
         tmphi.as_mut_slice(),
     );
+    // SAFETY: `dwt_s123_vertical_scalar` writes every temporary coefficient.
+    let tmplo = unsafe { tmplo.assume_init() };
+    // SAFETY: `dwt_s123_vertical_scalar` writes every temporary coefficient.
+    let tmphi = unsafe { tmphi.assume_init() };
     dwt_s123_horizontal_scalar(tmplo.as_slice(), tmphi.as_slice(), width, h_half, scale)
 }
 
@@ -214,8 +219,8 @@ pub(crate) fn dwt_s123_vertical_scalar(
     width: usize,
     height: usize,
     scale: usize,
-    tmplo: &mut [i32],
-    tmphi: &mut [i32],
+    tmplo: &mut [MaybeUninit<i32>],
+    tmphi: &mut [MaybeUninit<i32>],
 ) {
     let (round_vp, shift_vp, _, _) = SCALE_PARAMS[scale];
     let h_half = height.div_ceil(2);
@@ -247,8 +252,8 @@ pub(crate) fn dwt_s123_vertical_scalar(
                 + FILTER_HI[2] as i64 * s2
                 + FILTER_HI[3] as i64 * s3;
 
-            tmplo[row_offset + j] = ((al + round_vp) >> shift_vp) as i32;
-            tmphi[row_offset + j] = ((ah + round_vp) >> shift_vp) as i32;
+            tmplo[row_offset + j].write(((al + round_vp) >> shift_vp) as i32);
+            tmphi[row_offset + j].write(((ah + round_vp) >> shift_vp) as i32);
         }
     }
 }
@@ -298,10 +303,11 @@ pub(crate) fn dwt_s123_horizontal_scalar(
 ) -> Bands32 {
     let (_, _, round_hp, shift_hp) = SCALE_PARAMS[scale];
     let w_half = width.div_ceil(2);
-    let mut band_a = vec![0i32; h_half * w_half];
-    let mut band_v = vec![0i32; h_half * w_half];
-    let mut band_h = vec![0i32; h_half * w_half];
-    let mut band_d = vec![0i32; h_half * w_half];
+    let n = h_half * w_half;
+    let mut band_a = Vec::with_capacity(n);
+    let mut band_v = Vec::with_capacity(n);
+    let mut band_h = Vec::with_capacity(n);
+    let mut band_d = Vec::with_capacity(n);
 
     debug_assert_eq!(tmplo.len(), h_half * width);
     debug_assert_eq!(tmphi.len(), h_half * width);
@@ -309,22 +315,16 @@ pub(crate) fn dwt_s123_horizontal_scalar(
     for i in 0..h_half {
         let src_row_start = i * width;
         let src_row_end = src_row_start + width;
-        let dst_row_start = i * w_half;
-        let dst_row_end = dst_row_start + w_half;
         let tmplo_row = &tmplo[src_row_start..src_row_end];
         let tmphi_row = &tmphi[src_row_start..src_row_end];
-        let band_a_row = &mut band_a[dst_row_start..dst_row_end];
-        let band_v_row = &mut band_v[dst_row_start..dst_row_end];
-        let band_h_row = &mut band_h[dst_row_start..dst_row_end];
-        let band_d_row = &mut band_d[dst_row_start..dst_row_end];
 
         for j in 0..w_half {
             let (a, v, h, d) =
                 dwt_s123_horizontal_scalar_at(tmplo_row, tmphi_row, width, j, round_hp, shift_hp);
-            band_a_row[j] = a;
-            band_v_row[j] = v;
-            band_h_row[j] = h;
-            band_d_row[j] = d;
+            band_a.push(a);
+            band_v.push(v);
+            band_h.push(h);
+            band_d.push(d);
         }
     }
 
