@@ -1,6 +1,6 @@
 use vmaf_cpu::SimdBackend;
 
-use super::ScaleStat;
+use super::{ScaleStat, VifStatWorkspace};
 
 pub(super) fn vif_statistic(
     ref_plane: &[u16],
@@ -10,12 +10,13 @@ pub(super) fn vif_statistic(
     bpc: u8,
     scale: usize,
     vif_enhn_gain_limit: f64,
+    workspace: &mut VifStatWorkspace,
     backend: SimdBackend,
 ) -> ScaleStat {
     let _ = backend;
     // Future NEON kernels can reuse this dispatch entry point without reshaping
     // the extractor or scalar fallbacks.
-    super::vif_statistic_scalar(
+    super::vif_statistic_scalar_with_workspace(
         ref_plane,
         dis_plane,
         width,
@@ -23,5 +24,6 @@ pub(super) fn vif_statistic(
         bpc,
         scale,
         vif_enhn_gain_limit,
+        workspace,
     )
 }

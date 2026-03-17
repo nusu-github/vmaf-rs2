@@ -18,6 +18,52 @@ pub(crate) struct ScaleStat {
     pub den: f64,
 }
 
+/// Reusable aligned row buffers for one VIF statistic pass.
+#[derive(Debug)]
+pub(crate) struct VifStatWorkspace {
+    tmp_mu1: AlignedScratch<u16, Align32>,
+    tmp_mu2: AlignedScratch<u16, Align32>,
+    tmp_ref_sq: AlignedScratch<u32, Align32>,
+    tmp_dis_sq: AlignedScratch<u32, Align32>,
+    tmp_ref_dis: AlignedScratch<u32, Align32>,
+}
+
+impl Default for VifStatWorkspace {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl VifStatWorkspace {
+    pub(crate) fn new(max_width: usize) -> Self {
+        Self {
+            tmp_mu1: AlignedScratch::zeroed(max_width),
+            tmp_mu2: AlignedScratch::zeroed(max_width),
+            tmp_ref_sq: AlignedScratch::zeroed(max_width),
+            tmp_dis_sq: AlignedScratch::zeroed(max_width),
+            tmp_ref_dis: AlignedScratch::zeroed(max_width),
+        }
+    }
+
+    fn prepare(&mut self, width: usize) {
+        if self.tmp_mu1.len() < width {
+            self.tmp_mu1 = AlignedScratch::zeroed(width);
+        }
+        if self.tmp_mu2.len() < width {
+            self.tmp_mu2 = AlignedScratch::zeroed(width);
+        }
+        if self.tmp_ref_sq.len() < width {
+            self.tmp_ref_sq = AlignedScratch::zeroed(width);
+        }
+        if self.tmp_dis_sq.len() < width {
+            self.tmp_dis_sq = AlignedScratch::zeroed(width);
+        }
+        if self.tmp_ref_dis.len() < width {
+            self.tmp_ref_dis = AlignedScratch::zeroed(width);
+        }
+    }
+}
+
 #[derive(Default)]
 struct RunningStatAccumulators {
     accum_num_log: i64,
@@ -41,8 +87,33 @@ pub(crate) fn vif_statistic(
     vif_enhn_gain_limit: f64,
     backend: SimdBackend,
 ) -> ScaleStat {
+    let mut workspace = VifStatWorkspace::new(width);
+    vif_statistic_with_workspace(
+        ref_plane,
+        dis_plane,
+        width,
+        height,
+        bpc,
+        scale,
+        vif_enhn_gain_limit,
+        &mut workspace,
+        backend,
+    )
+}
+
+pub(crate) fn vif_statistic_with_workspace(
+    ref_plane: &[u16],
+    dis_plane: &[u16],
+    width: usize,
+    height: usize,
+    bpc: u8,
+    scale: usize,
+    vif_enhn_gain_limit: f64,
+    workspace: &mut VifStatWorkspace,
+    backend: SimdBackend,
+) -> ScaleStat {
     match backend {
-        SimdBackend::Scalar => vif_statistic_scalar(
+        SimdBackend::Scalar => vif_statistic_scalar_with_workspace(
             ref_plane,
             dis_plane,
             width,
@@ -50,6 +121,7 @@ pub(crate) fn vif_statistic(
             bpc,
             scale,
             vif_enhn_gain_limit,
+            workspace,
         ),
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         SimdBackend::X86Sse2 | SimdBackend::X86Avx2Fma | SimdBackend::X86Avx512 => {
@@ -61,6 +133,7 @@ pub(crate) fn vif_statistic(
                 bpc,
                 scale,
                 vif_enhn_gain_limit,
+                workspace,
                 backend,
             )
         }
@@ -72,10 +145,11 @@ pub(crate) fn vif_statistic(
             bpc,
             scale,
             vif_enhn_gain_limit,
+            workspace,
             backend,
         ),
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        _ => vif_statistic_scalar(
+        _ => vif_statistic_scalar_with_workspace(
             ref_plane,
             dis_plane,
             width,
@@ -83,11 +157,12 @@ pub(crate) fn vif_statistic(
             bpc,
             scale,
             vif_enhn_gain_limit,
+            workspace,
         ),
     }
 }
 
-fn vif_statistic_scalar(
+fn vif_statistic_scalar_with_workspace(
     ref_plane: &[u16],
     dis_plane: &[u16],
     width: usize,
@@ -95,6 +170,7 @@ fn vif_statistic_scalar(
     bpc: u8,
     scale: usize,
     vif_enhn_gain_limit: f64,
+    workspace: &mut VifStatWorkspace,
 ) -> ScaleStat {
     let filt = &FILTER[scale][..FILTER_WIDTH[scale]];
     let half = filt.len() / 2;
@@ -102,16 +178,12 @@ fn vif_statistic_scalar(
     let uses_wrapping_sq = bpc == 8 && scale == 0;
     let mut accum = RunningStatAccumulators::default();
 
-    let mut tmp_mu1_buf = AlignedScratch::<u16, Align32>::zeroed(width);
-    let mut tmp_mu2_buf = AlignedScratch::<u16, Align32>::zeroed(width);
-    let mut tmp_ref_sq_buf = AlignedScratch::<u32, Align32>::zeroed(width);
-    let mut tmp_dis_sq_buf = AlignedScratch::<u32, Align32>::zeroed(width);
-    let mut tmp_ref_dis_buf = AlignedScratch::<u32, Align32>::zeroed(width);
-    let tmp_mu1 = tmp_mu1_buf.as_mut_slice();
-    let tmp_mu2 = tmp_mu2_buf.as_mut_slice();
-    let tmp_ref_sq = tmp_ref_sq_buf.as_mut_slice();
-    let tmp_dis_sq = tmp_dis_sq_buf.as_mut_slice();
-    let tmp_ref_dis = tmp_ref_dis_buf.as_mut_slice();
+    workspace.prepare(width);
+    let tmp_mu1 = &mut workspace.tmp_mu1.as_mut_slice()[..width];
+    let tmp_mu2 = &mut workspace.tmp_mu2.as_mut_slice()[..width];
+    let tmp_ref_sq = &mut workspace.tmp_ref_sq.as_mut_slice()[..width];
+    let tmp_dis_sq = &mut workspace.tmp_dis_sq.as_mut_slice()[..width];
+    let tmp_ref_dis = &mut workspace.tmp_ref_dis.as_mut_slice()[..width];
 
     for i in 0..height {
         let row_offsets = reflected_row_offsets(i, height, width, half, filt.len());
@@ -412,4 +484,67 @@ fn finalize_scale_stat(accum: RunningStatAccumulators) -> ScaleStat {
     let den = accum.accum_den_log as f64 / 2048.0 + accum.accum_den_non_log as f64;
 
     ScaleStat { num, den }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmaf_cpu::SimdBackend;
+
+    fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    ((x * 13 + y * 19 + (x ^ y) * 11 + x * y * 3 + bias) % modulus as usize) as u16
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_path_matches_owned_wrapper() {
+        let width = 27;
+        let height = 17;
+        let reference = patterned_plane(width, height, 1024, 5);
+        let distorted = patterned_plane(width, height, 1024, 23);
+        let expected = vif_statistic(
+            &reference,
+            &distorted,
+            width,
+            height,
+            10,
+            0,
+            100.0,
+            SimdBackend::Scalar,
+        );
+
+        let mut workspace = VifStatWorkspace::new(width);
+        let actual = vif_statistic_with_workspace(
+            &reference,
+            &distorted,
+            width,
+            height,
+            10,
+            0,
+            100.0,
+            &mut workspace,
+            SimdBackend::Scalar,
+        );
+        assert_eq!(expected.num.to_bits(), actual.num.to_bits());
+        assert_eq!(expected.den.to_bits(), actual.den.to_bits());
+
+        let repeated = vif_statistic_with_workspace(
+            &reference,
+            &distorted,
+            width,
+            height,
+            10,
+            0,
+            100.0,
+            &mut workspace,
+            SimdBackend::Scalar,
+        );
+        assert_eq!(expected.num.to_bits(), repeated.num.to_bits());
+        assert_eq!(expected.den.to_bits(), repeated.den.to_bits());
+    }
 }
