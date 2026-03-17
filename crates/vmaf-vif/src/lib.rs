@@ -46,6 +46,11 @@ mod tests {
         assert_eq!(expected.combined.to_bits(), actual.combined.to_bits());
     }
 
+    fn assert_scale_stat_match(expected: &super::stat::ScaleStat, actual: &super::stat::ScaleStat) {
+        assert_eq!(expected.num.to_bits(), actual.num.to_bits());
+        assert_eq!(expected.den.to_bits(), actual.den.to_bits());
+    }
+
     // ── log2_table §8 conformance ─────────────────────────────────────────────
 
     #[test]
@@ -200,8 +205,7 @@ mod tests {
             SimdBackend::Scalar,
         );
         let simd = vif_statistic(&ref_plane, &dis_plane, w, h, 10, 0, 100.0, backend);
-        assert_eq!(scalar.num.to_bits(), simd.num.to_bits());
-        assert_eq!(scalar.den.to_bits(), simd.den.to_bits());
+        assert_scale_stat_match(&scalar, &simd);
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -227,8 +231,80 @@ mod tests {
             SimdBackend::Scalar,
         );
         let simd = vif_statistic(&ref_plane, &dis_plane, w, h, 8, 0, 100.0, backend);
-        assert_eq!(scalar.num.to_bits(), simd.num.to_bits());
-        assert_eq!(scalar.den.to_bits(), simd.den.to_bits());
+        assert_scale_stat_match(&scalar, &simd);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn vif_statistic_explicit_avx2_matches_scalar_on_misaligned_odd_non_wrapping_scale0() {
+        if !SimdBackend::X86Avx2Fma.is_available() {
+            return;
+        }
+
+        let w = 29usize;
+        let h = 13usize;
+        let bpc = 12u8;
+        let modulus = 1usize << bpc;
+        let len = w * h;
+        let mut ref_storage = vec![0u16; len + 5];
+        let mut dis_storage = vec![0u16; len + 7];
+        let ref_plane = &mut ref_storage[1..1 + len];
+        let dis_plane = &mut dis_storage[3..3 + len];
+        ref_plane.copy_from_slice(&patterned_plane(w, h, modulus as u16, 19));
+        dis_plane.copy_from_slice(&patterned_plane(w, h, modulus as u16, 71));
+
+        let scalar = vif_statistic(
+            ref_plane,
+            dis_plane,
+            w,
+            h,
+            bpc,
+            0,
+            100.0,
+            SimdBackend::Scalar,
+        );
+        let avx2 = vif_statistic(
+            ref_plane,
+            dis_plane,
+            w,
+            h,
+            bpc,
+            0,
+            100.0,
+            SimdBackend::X86Avx2Fma,
+        );
+        assert_scale_stat_match(&scalar, &avx2);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn vif_statistic_explicit_avx2_matches_scalar_on_misaligned_odd_wrapping_scale0() {
+        if !SimdBackend::X86Avx2Fma.is_available() {
+            return;
+        }
+
+        let w = 27usize;
+        let h = 17usize;
+        let len = w * h;
+        let mut ref_storage = vec![0u16; len + 7];
+        let mut dis_storage = vec![0u16; len + 9];
+        let ref_plane = &mut ref_storage[3..3 + len];
+        let dis_plane = &mut dis_storage[1..1 + len];
+        ref_plane.copy_from_slice(&patterned_plane(w, h, 256, 5));
+        dis_plane.copy_from_slice(&patterned_plane(w, h, 256, 133));
+
+        let scalar = vif_statistic(ref_plane, dis_plane, w, h, 8, 0, 100.0, SimdBackend::Scalar);
+        let avx2 = vif_statistic(
+            ref_plane,
+            dis_plane,
+            w,
+            h,
+            8,
+            0,
+            100.0,
+            SimdBackend::X86Avx2Fma,
+        );
+        assert_scale_stat_match(&scalar, &avx2);
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -252,7 +328,7 @@ mod tests {
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
-    fn extractor_explicit_backends_match_scalar_on_odd_12bit_pyramid() {
+    fn extractor_explicit_backends_match_scalar_on_misaligned_odd_12bit_pyramid() {
         let w = 19usize;
         let h = 17usize;
         let bpc = 12u8;
