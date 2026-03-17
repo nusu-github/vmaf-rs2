@@ -47,8 +47,6 @@ pub struct VmafContext {
     adm: AdmExtractor,
     motion: MotionExtractor,
     width: usize,
-    height: usize,
-    bpc: u8,
     pending: Vec<PendingFrame>,
     per_frame_scores: Vec<FrameScore>,
     frame_count: usize,
@@ -73,8 +71,6 @@ impl VmafContext {
             motion: MotionExtractor::new(width, height, bpc),
             model,
             width,
-            height,
-            bpc,
             pending: Vec::new(),
             per_frame_scores: Vec::new(),
             frame_count: 0,
@@ -104,13 +100,16 @@ impl VmafContext {
     pub fn push_frame_batch(&mut self, frames: &[(&[u16], &[u16])]) -> Vec<FrameScore> {
         use rayon::prelude::*;
 
+        let vif = &self.vif;
+        let adm = &self.adm;
+        let motion = &self.motion;
+        let stride = self.width;
         let extracted: Vec<_> = frames
             .par_iter()
             .map(|(r, d)| {
-                let vif_scores = self.vif.compute_frame(r, d);
-                let adm_score = self.adm.compute_frame(r, d);
-                let blur =
-                    vmaf_motion::blur_frame(r, self.width, self.width, self.height, self.bpc);
+                let vif_scores = vif.compute_frame(r, d);
+                let adm_score = adm.compute_frame(r, d);
+                let blur = motion.prepare_blurred_frame(r, stride);
                 (vif_scores, adm_score, blur)
             })
             .collect();
@@ -239,5 +238,181 @@ mod tests {
         let ds = (last_a.score - last_b.score).abs();
 
         assert!(dv0 > 1e-9 || dv3 > 1e-9 || ds > 1e-9);
+    }
+
+    #[test]
+    fn batch_and_sequential_paths_match() {
+        let model_json = include_str!("../../../models/vmaf_v0.6.1.json");
+        let (w, h, bpc) = (64usize, 48usize, 8u8);
+
+        let frames: Vec<(Vec<u16>, Vec<u16>)> = (0..5usize)
+            .map(|frame_idx| {
+                let reference: Vec<u16> = (0..h)
+                    .flat_map(|y| {
+                        (0..w)
+                            .map(move |x| ((x * 3 + y * 5 + frame_idx * 11 + (x ^ y)) % 256) as u16)
+                    })
+                    .collect();
+                let distorted = reference
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &value)| {
+                        value.saturating_sub(((frame_idx * 7 + idx * 3) % 19) as u16)
+                    })
+                    .collect();
+                (reference, distorted)
+            })
+            .collect();
+
+        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc);
+        let mut batch = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc);
+
+        let mut sequential_scores = Vec::new();
+        for (reference, distorted) in &frames {
+            if let Some(score) = sequential.push_frame(reference, distorted) {
+                sequential_scores.push(score);
+            }
+        }
+        if let Some(score) = sequential.flush() {
+            sequential_scores.push(score);
+        }
+
+        let batch_inputs_a: Vec<_> = frames[..3]
+            .iter()
+            .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
+            .collect();
+        let batch_inputs_b: Vec<_> = frames[3..]
+            .iter()
+            .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
+            .collect();
+
+        let mut batch_scores = batch.push_frame_batch(&batch_inputs_a);
+        batch_scores.extend(batch.push_frame_batch(&batch_inputs_b));
+        if let Some(score) = batch.flush() {
+            batch_scores.push(score);
+        }
+
+        assert_eq!(sequential_scores.len(), batch_scores.len());
+
+        for (sequential_score, batch_score) in sequential_scores.iter().zip(&batch_scores) {
+            assert_eq!(sequential_score.frame_index, batch_score.frame_index);
+            assert_eq!(
+                sequential_score.score.to_bits(),
+                batch_score.score.to_bits()
+            );
+            assert_eq!(sequential_score.adm2.to_bits(), batch_score.adm2.to_bits());
+            assert_eq!(
+                sequential_score.motion2.to_bits(),
+                batch_score.motion2.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale0.to_bits(),
+                batch_score.vif_scale0.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale1.to_bits(),
+                batch_score.vif_scale1.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale2.to_bits(),
+                batch_score.vif_scale2.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale3.to_bits(),
+                batch_score.vif_scale3.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn batch_and_sequential_paths_match_on_odd_10bit_frames() {
+        let model_json = include_str!("../../../models/vmaf_v0.6.1.json");
+        let (w, h, bpc) = (53usize, 37usize, 10u8);
+        let modulus = 1usize << bpc;
+
+        let frames: Vec<(Vec<u16>, Vec<u16>)> = (0..6usize)
+            .map(|frame_idx| {
+                let reference: Vec<u16> = (0..h)
+                    .flat_map(|y| {
+                        (0..w).map(move |x| {
+                            ((x * 17 + y * 29 + frame_idx * 31 + (x ^ (y * 3)) + x * y * 5)
+                                % modulus) as u16
+                        })
+                    })
+                    .collect();
+                let distorted = reference
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &value)| {
+                        value.saturating_sub(((frame_idx * 13 + idx * 5 + idx / w) % 37) as u16)
+                    })
+                    .collect();
+                (reference, distorted)
+            })
+            .collect();
+
+        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc);
+        let mut batch = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc);
+
+        let mut sequential_scores = Vec::new();
+        for (reference, distorted) in &frames {
+            if let Some(score) = sequential.push_frame(reference, distorted) {
+                sequential_scores.push(score);
+            }
+        }
+        if let Some(score) = sequential.flush() {
+            sequential_scores.push(score);
+        }
+
+        let batch_inputs_a: Vec<_> = frames[..1]
+            .iter()
+            .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
+            .collect();
+        let batch_inputs_b: Vec<_> = frames[1..4]
+            .iter()
+            .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
+            .collect();
+        let batch_inputs_c: Vec<_> = frames[4..]
+            .iter()
+            .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
+            .collect();
+
+        let mut batch_scores = batch.push_frame_batch(&batch_inputs_a);
+        batch_scores.extend(batch.push_frame_batch(&batch_inputs_b));
+        batch_scores.extend(batch.push_frame_batch(&batch_inputs_c));
+        if let Some(score) = batch.flush() {
+            batch_scores.push(score);
+        }
+
+        assert_eq!(sequential_scores.len(), batch_scores.len());
+
+        for (sequential_score, batch_score) in sequential_scores.iter().zip(&batch_scores) {
+            assert_eq!(sequential_score.frame_index, batch_score.frame_index);
+            assert_eq!(
+                sequential_score.score.to_bits(),
+                batch_score.score.to_bits()
+            );
+            assert_eq!(sequential_score.adm2.to_bits(), batch_score.adm2.to_bits());
+            assert_eq!(
+                sequential_score.motion2.to_bits(),
+                batch_score.motion2.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale0.to_bits(),
+                batch_score.vif_scale0.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale1.to_bits(),
+                batch_score.vif_scale1.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale2.to_bits(),
+                batch_score.vif_scale2.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale3.to_bits(),
+                batch_score.vif_scale3.to_bits()
+            );
+        }
     }
 }
