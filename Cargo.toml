@@ -27,6 +27,7 @@ rayon = "1.11"
 
 # CLI
 clap = { version = "4.6", features = ["derive"] }
+indicatif = "0.17"
 
 # Video input
 y4m = "0.8"

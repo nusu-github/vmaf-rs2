@@ -1,20 +1,13 @@
 //! vmaf-cli — command-line interface for VMAF scoring
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
-use vmaf::{load_model, FrameScore, PoolMethod, VmafContext, VmafOptions};
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum OutputMode {
-    /// Emit the full per-frame JSON report.
-    Json,
-    /// Emit only the pooled score.
-    Pooled,
-    /// Do not emit any stdout output.
-    None,
-}
+use std::time::Instant;
+use vmaf::{load_model, PoolMethod, VmafContext, VmafOptions};
 
 #[derive(Debug, Parser)]
+#[command(version, about = "VMAF video quality metric")]
 struct Args {
     /// Reference (original) Y4M file
     #[arg(short, long)]
@@ -34,17 +27,12 @@ struct Args {
     /// Number of threads to use (0 = auto)
     #[arg(long, default_value_t = 0)]
     threads: usize,
-    /// Suppress progress/status logging on stderr.
-    ///
-    /// Useful for benchmarking to avoid per-frame stderr overhead.
+    /// Suppress progress display on stderr.
     #[arg(short, long, visible_alias = "no-progress")]
     quiet: bool,
-    /// Stdout output mode.
-    ///
-    /// Keep the default full JSON for compatibility, or use `pooled`/`none`
-    /// during benchmarks to avoid formatting the full report.
-    #[arg(long, value_enum, default_value_t = OutputMode::Json)]
-    output: OutputMode,
+    /// Output full per-frame JSON report instead of just the pooled score.
+    #[arg(long)]
+    json: bool,
     /// Apply the model's score_transform (spec mode). Disabled by default to match
     /// the reference ./vmaf behavior for bundled v0.6.x models.
     #[arg(long, default_value_t = false)]
@@ -71,25 +59,6 @@ fn parse_pool_method(s: &str) -> Result<PoolMethod, Box<dyn std::error::Error>> 
         "max" => Ok(PoolMethod::Max),
         other => Err(format!("unknown pool method: {other}").into()),
     }
-}
-
-fn emit_frame_progress(quiet: bool, fs: &FrameScore) {
-    if quiet {
-        return;
-    }
-
-    eprintln!(
-        "[vmaf] frame {:3}  score={:.4}  adm2={:.4}  motion2={:.4}  \
-         vif=[{:.4},{:.4},{:.4},{:.4}]",
-        fs.frame_index,
-        fs.score,
-        fs.adm2,
-        fs.motion2,
-        fs.vif_scale0,
-        fs.vif_scale1,
-        fs.vif_scale2,
-        fs.vif_scale3,
-    );
 }
 
 fn emit_full_json(ctx: &VmafContext, pooled: f64, pool_method: &str) {
@@ -119,8 +88,23 @@ fn emit_full_json(ctx: &VmafContext, pooled: f64, pool_method: &str) {
     println!("}}");
 }
 
+fn make_progress_bar() -> ProgressBar {
+    let pb = ProgressBar::new_spinner();
+    pb.set_style(
+        ProgressStyle::with_template("{pos} frames {spinner} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    pb.enable_steady_tick(std::time::Duration::from_millis(80));
+    pb
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+
+    if !args.quiet {
+        eprintln!("VMAF version {}", env!("CARGO_PKG_VERSION"));
+    }
 
     let json = std::fs::read_to_string(&args.model)?;
     let model = load_model(&json).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -135,10 +119,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let width = ref_dec.get_width();
     let height = ref_dec.get_height();
     let bpc = ref_dec.get_colorspace().get_bit_depth() as u8;
-
-    if !args.quiet {
-        eprintln!("[vmaf] {}×{} bpc={} model loaded", width, height, bpc);
-    }
 
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -156,13 +136,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             apply_score_transform: args.apply_score_transform,
         },
     );
-    let mut frame_count = 0usize;
+
+    let pb = if args.quiet {
+        ProgressBar::hidden()
+    } else {
+        make_progress_bar()
+    };
+
     let batch_size = if args.threads > 0 {
         args.threads * 2
     } else {
         rayon::current_num_threads() * 2
     };
     let mut batch = Vec::with_capacity(batch_size);
+    let mut frame_count = 0usize;
+    let start = Instant::now();
 
     loop {
         let ref_frame = match ref_dec.read_frame() {
@@ -186,12 +174,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|(r, d)| (r.as_slice(), d.as_slice()))
                 .collect();
-            for fs in ctx.push_frame_batch(&refs) {
-                emit_frame_progress(args.quiet, &fs);
-            }
+            ctx.push_frame_batch(&refs);
             frame_count += batch.len();
-            if !args.quiet {
-                eprintln!("[vmaf] pushed {} frames…", frame_count);
+            pb.set_position(frame_count as u64);
+            let elapsed = start.elapsed().as_secs_f64();
+            if elapsed > 0.0 {
+                pb.set_message(format!("{:.2} FPS", frame_count as f64 / elapsed));
             }
             batch.clear();
         }
@@ -202,25 +190,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|(r, d)| (r.as_slice(), d.as_slice()))
             .collect();
-        for fs in ctx.push_frame_batch(&refs) {
-            emit_frame_progress(args.quiet, &fs);
-        }
+        ctx.push_frame_batch(&refs);
         frame_count += batch.len();
+        pb.set_position(frame_count as u64);
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            pb.set_message(format!("{:.2} FPS", frame_count as f64 / elapsed));
+        }
     }
 
-    if !args.quiet {
-        eprintln!("[vmaf] pushed {} frames total, flushing…", frame_count);
-    }
-    if let Some(fs) = ctx.flush() {
-        emit_frame_progress(args.quiet, &fs);
-    }
+    ctx.flush();
+    pb.finish();
 
     let pooled = ctx.pool_score(pool_method, args.n_subsample);
 
-    match args.output {
-        OutputMode::Json => emit_full_json(&ctx, pooled, &args.pool_method),
-        OutputMode::Pooled => println!("{pooled:.6}"),
-        OutputMode::None => {}
+    if args.json {
+        emit_full_json(&ctx, pooled, &args.pool_method);
+    } else {
+        println!("{}: {:.6}", args.model.display(), pooled);
     }
 
     Ok(())
@@ -246,35 +233,33 @@ mod tests {
     }
 
     #[test]
-    fn cli_defaults_preserve_existing_behavior() {
+    fn cli_defaults() {
         let args = parse_args(&[]);
 
         assert!(!args.quiet);
-        assert_eq!(args.output, OutputMode::Json);
+        assert!(!args.json);
     }
 
     #[test]
-    fn cli_supports_quiet_alias_and_lightweight_output_modes() {
-        let args = parse_args(&["--no-progress", "--output", "none"]);
+    fn cli_quiet_and_json_flags() {
+        let args = parse_args(&["--no-progress", "--json"]);
 
         assert!(args.quiet);
-        assert_eq!(args.output, OutputMode::None);
+        assert!(args.json);
 
-        let args = parse_args(&["--quiet", "--output", "pooled"]);
+        let args = parse_args(&["--quiet"]);
 
         assert!(args.quiet);
-        assert_eq!(args.output, OutputMode::Pooled);
+        assert!(!args.json);
     }
 
     #[test]
-    fn help_text_mentions_benchmark_controls() {
+    fn help_text_mentions_controls() {
         let mut cmd = Args::command();
         let help = cmd.render_long_help().to_string();
 
         assert!(help.contains("--quiet"));
         assert!(help.contains("no-progress"));
-        assert!(help.contains("--output <OUTPUT>"));
-        assert!(help.contains("pooled"));
-        assert!(help.contains("none"));
+        assert!(help.contains("--json"));
     }
 }
