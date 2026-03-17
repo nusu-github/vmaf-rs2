@@ -1,13 +1,48 @@
 //! VIF feature extractor — spec §4.2
 
-use crate::filter::subsample;
-use crate::stat::vif_statistic;
+use crate::filter::{subsample_into, SubsampleWorkspace};
+use crate::stat::{vif_statistic_with_workspace, VifStatWorkspace};
 use vmaf_cpu::SimdBackend;
 
 /// Per-frame VIF scores — 4 scales + combined.
 pub struct VifScores {
     pub scale: [f64; 4],
     pub combined: f64,
+}
+
+/// Reusable internal buffers for per-frame VIF extraction.
+///
+/// This is intentionally exposed to sibling crates so orchestration can keep a
+/// worker-local workspace without forcing public API callers to manage scratch.
+#[doc(hidden)]
+pub struct VifWorkspace {
+    ref_a: Vec<u16>,
+    ref_b: Vec<u16>,
+    dis_a: Vec<u16>,
+    dis_b: Vec<u16>,
+    stat: VifStatWorkspace,
+    subsample: SubsampleWorkspace,
+}
+
+impl VifWorkspace {
+    fn new(width: usize, height: usize) -> Self {
+        let next_level_area = width.div_ceil(2) * height.div_ceil(2);
+        Self {
+            ref_a: Vec::with_capacity(next_level_area),
+            ref_b: Vec::with_capacity(next_level_area),
+            dis_a: Vec::with_capacity(next_level_area),
+            dis_b: Vec::with_capacity(next_level_area),
+            stat: VifStatWorkspace::new(width),
+            subsample: SubsampleWorkspace::new(width * height),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CurrentScaleLevel {
+    Input,
+    A,
+    B,
 }
 
 /// Stateless VIF extractor: computes all 4 scale scores for one frame pair.
@@ -49,10 +84,18 @@ impl VifExtractor {
         }
     }
 
-    /// Compute VIF scores for one ref/dis frame pair — spec §4.2.
-    ///
-    /// `ref_plane` and `dis_plane` are row-major luma planes (`width × height`).
-    pub fn compute_frame(&self, ref_plane: &[u16], dis_plane: &[u16]) -> VifScores {
+    #[doc(hidden)]
+    pub fn make_workspace(&self) -> VifWorkspace {
+        VifWorkspace::new(self.width, self.height)
+    }
+
+    #[doc(hidden)]
+    pub fn compute_frame_with_workspace(
+        &self,
+        workspace: &mut VifWorkspace,
+        ref_plane: &[u16],
+        dis_plane: &[u16],
+    ) -> VifScores {
         let (w, h, bpc) = (self.width, self.height, self.bpc);
         let limit = self.vif_enhn_gain_limit;
         let backend = self.backend;
@@ -60,34 +103,113 @@ impl VifExtractor {
         let mut nums = [0.0f64; 4];
         let mut dens = [0.0f64; 4];
 
-        let s0 = vif_statistic(ref_plane, dis_plane, w, h, bpc, 0, limit, backend);
+        let s0 = vif_statistic_with_workspace(
+            ref_plane,
+            dis_plane,
+            w,
+            h,
+            bpc,
+            0,
+            limit,
+            &mut workspace.stat,
+            backend,
+        );
         nums[0] = s0.num;
         dens[0] = s0.den;
 
-        let mut cur_ref = ref_plane.to_vec();
-        let mut cur_dis = dis_plane.to_vec();
+        let mut cur_level = CurrentScaleLevel::Input;
         let mut cur_w = w;
         let mut cur_h = h;
 
         for scale in 0..3usize {
-            let (next_ref, next_dis, next_w, next_h) =
-                subsample(&cur_ref, &cur_dis, cur_w, cur_h, bpc, scale, backend);
-
-            let ss = vif_statistic(
-                &next_ref,
-                &next_dis,
-                next_w,
-                next_h,
-                bpc,
-                scale + 1,
-                limit,
-                backend,
-            );
+            let (ss, next_level, next_w, next_h) = match cur_level {
+                CurrentScaleLevel::Input => {
+                    let (next_w, next_h) = subsample_into(
+                        ref_plane,
+                        dis_plane,
+                        cur_w,
+                        cur_h,
+                        bpc,
+                        scale,
+                        backend,
+                        &mut workspace.subsample,
+                        &mut workspace.ref_a,
+                        &mut workspace.dis_a,
+                    );
+                    let next_len = next_w * next_h;
+                    let ss = vif_statistic_with_workspace(
+                        &workspace.ref_a[..next_len],
+                        &workspace.dis_a[..next_len],
+                        next_w,
+                        next_h,
+                        bpc,
+                        scale + 1,
+                        limit,
+                        &mut workspace.stat,
+                        backend,
+                    );
+                    (ss, CurrentScaleLevel::A, next_w, next_h)
+                }
+                CurrentScaleLevel::A => {
+                    let cur_len = cur_w * cur_h;
+                    let (next_w, next_h) = subsample_into(
+                        &workspace.ref_a[..cur_len],
+                        &workspace.dis_a[..cur_len],
+                        cur_w,
+                        cur_h,
+                        bpc,
+                        scale,
+                        backend,
+                        &mut workspace.subsample,
+                        &mut workspace.ref_b,
+                        &mut workspace.dis_b,
+                    );
+                    let next_len = next_w * next_h;
+                    let ss = vif_statistic_with_workspace(
+                        &workspace.ref_b[..next_len],
+                        &workspace.dis_b[..next_len],
+                        next_w,
+                        next_h,
+                        bpc,
+                        scale + 1,
+                        limit,
+                        &mut workspace.stat,
+                        backend,
+                    );
+                    (ss, CurrentScaleLevel::B, next_w, next_h)
+                }
+                CurrentScaleLevel::B => {
+                    let cur_len = cur_w * cur_h;
+                    let (next_w, next_h) = subsample_into(
+                        &workspace.ref_b[..cur_len],
+                        &workspace.dis_b[..cur_len],
+                        cur_w,
+                        cur_h,
+                        bpc,
+                        scale,
+                        backend,
+                        &mut workspace.subsample,
+                        &mut workspace.ref_a,
+                        &mut workspace.dis_a,
+                    );
+                    let next_len = next_w * next_h;
+                    let ss = vif_statistic_with_workspace(
+                        &workspace.ref_a[..next_len],
+                        &workspace.dis_a[..next_len],
+                        next_w,
+                        next_h,
+                        bpc,
+                        scale + 1,
+                        limit,
+                        &mut workspace.stat,
+                        backend,
+                    );
+                    (ss, CurrentScaleLevel::A, next_w, next_h)
+                }
+            };
             nums[scale + 1] = ss.num;
             dens[scale + 1] = ss.den;
-
-            cur_ref = next_ref;
-            cur_dis = next_dis;
+            cur_level = next_level;
             cur_w = next_w;
             cur_h = next_h;
         }
@@ -113,6 +235,14 @@ impl VifExtractor {
             combined,
         }
     }
+
+    /// Compute VIF scores for one ref/dis frame pair — spec §4.2.
+    ///
+    /// `ref_plane` and `dis_plane` are row-major luma planes (`width × height`).
+    pub fn compute_frame(&self, ref_plane: &[u16], dis_plane: &[u16]) -> VifScores {
+        let mut workspace = self.make_workspace();
+        self.compute_frame_with_workspace(&mut workspace, ref_plane, dis_plane)
+    }
 }
 
 fn effective_backend(backend: SimdBackend) -> SimdBackend {
@@ -131,5 +261,42 @@ fn effective_backend(backend: SimdBackend) -> SimdBackend {
             }
         }
         other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmaf_cpu::SimdBackend;
+
+    fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    ((x * 11 + y * 13 + (x ^ y) * 7 + x * y * 3 + bias) % modulus as usize) as u16
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_path_matches_plain_compute() {
+        let extractor = VifExtractor::with_backend(48, 48, 8, 100.0, SimdBackend::Scalar);
+        let reference = patterned_plane(48, 48, 255, 3);
+        let distorted = patterned_plane(48, 48, 255, 17);
+        let mut workspace = extractor.make_workspace();
+
+        let plain = extractor.compute_frame(&reference, &distorted);
+        let reused1 =
+            extractor.compute_frame_with_workspace(&mut workspace, &reference, &distorted);
+        let reused2 =
+            extractor.compute_frame_with_workspace(&mut workspace, &reference, &distorted);
+
+        for idx in 0..4 {
+            assert_eq!(plain.scale[idx].to_bits(), reused1.scale[idx].to_bits());
+            assert_eq!(plain.scale[idx].to_bits(), reused2.scale[idx].to_bits());
+        }
+        assert_eq!(plain.combined.to_bits(), reused1.combined.to_bits());
+        assert_eq!(plain.combined.to_bits(), reused2.combined.to_bits());
     }
 }

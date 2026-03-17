@@ -11,7 +11,7 @@ mod math;
 mod stat;
 mod tables;
 
-pub use extractor::{VifExtractor, VifScores};
+pub use extractor::{VifExtractor, VifScores, VifWorkspace};
 
 #[cfg(test)]
 mod tests {
