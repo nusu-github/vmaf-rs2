@@ -2,7 +2,40 @@
 
 use crate::filter::{subsample_into, SubsampleWorkspace};
 use crate::stat::{vif_statistic_with_workspace, VifStatWorkspace};
+use std::{error::Error, fmt};
 use vmaf_cpu::SimdBackend;
+
+const MIN_FRAME_DIMENSION: usize = 16;
+
+/// Errors produced by [`VifExtractor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VifError {
+    /// Width or height is below the minimum required by the spec kernels.
+    InvalidDimensions { width: usize, height: usize },
+    /// Bit depth is not supported by the integer pipeline.
+    InvalidBitDepth { bpc: u8 },
+    /// Width × height overflowed `usize`.
+    SampleCountOverflow { width: usize, height: usize },
+}
+
+impl fmt::Display for VifError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDimensions { width, height } => write!(
+                f,
+                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+            ),
+            Self::InvalidBitDepth { bpc } => {
+                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
+            }
+            Self::SampleCountOverflow { width, height } => {
+                write!(f, "sample count overflow for dimensions {width}x{height}")
+            }
+        }
+    }
+}
+
+impl Error for VifError {}
 
 /// Per-frame VIF scores — 4 scales + combined.
 pub struct VifScores {
@@ -58,7 +91,18 @@ pub struct VifExtractor {
 }
 
 impl VifExtractor {
-    pub fn new(width: usize, height: usize, bpc: u8, vif_enhn_gain_limit: f64) -> Self {
+    /// Create a VIF extractor for one frame geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`VifError`] when dimensions are below the spec minimum, the
+    /// bit depth is unsupported, or the frame area overflows `usize`.
+    pub fn new(
+        width: usize,
+        height: usize,
+        bpc: u8,
+        vif_enhn_gain_limit: f64,
+    ) -> Result<Self, VifError> {
         Self::with_backend(
             width,
             height,
@@ -74,14 +118,15 @@ impl VifExtractor {
         bpc: u8,
         vif_enhn_gain_limit: f64,
         backend: SimdBackend,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, VifError> {
+        validate_frame_geometry(width, height, bpc)?;
+        Ok(Self {
             width,
             height,
             bpc,
             vif_enhn_gain_limit,
             backend: effective_backend(backend),
-        }
+        })
     }
 
     #[doc(hidden)]
@@ -245,6 +290,19 @@ impl VifExtractor {
     }
 }
 
+fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), VifError> {
+    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
+        return Err(VifError::InvalidDimensions { width, height });
+    }
+    if !matches!(bpc, 8 | 10 | 12) {
+        return Err(VifError::InvalidBitDepth { bpc });
+    }
+    width
+        .checked_mul(height)
+        .ok_or(VifError::SampleCountOverflow { width, height })?;
+    Ok(())
+}
+
 fn effective_backend(backend: SimdBackend) -> SimdBackend {
     if !backend.is_available() {
         return SimdBackend::Scalar;
@@ -281,7 +339,7 @@ mod tests {
 
     #[test]
     fn workspace_path_matches_plain_compute() {
-        let extractor = VifExtractor::with_backend(48, 48, 8, 100.0, SimdBackend::Scalar);
+        let extractor = VifExtractor::with_backend(48, 48, 8, 100.0, SimdBackend::Scalar).unwrap();
         let reference = patterned_plane(48, 48, 255, 3);
         let distorted = patterned_plane(48, 48, 255, 17);
         let mut workspace = extractor.make_workspace();
@@ -298,5 +356,27 @@ mod tests {
         }
         assert_eq!(plain.combined.to_bits(), reused1.combined.to_bits());
         assert_eq!(plain.combined.to_bits(), reused2.combined.to_bits());
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_dimensions_and_bpc() {
+        assert!(matches!(
+            VifExtractor::new(15, 16, 8, 100.0),
+            Err(VifError::InvalidDimensions {
+                width: 15,
+                height: 16
+            })
+        ));
+        assert!(matches!(
+            VifExtractor::new(16, 15, 8, 100.0),
+            Err(VifError::InvalidDimensions {
+                width: 16,
+                height: 15
+            })
+        ));
+        assert!(matches!(
+            VifExtractor::new(16, 16, 9, 100.0),
+            Err(VifError::InvalidBitDepth { bpc: 9 })
+        ));
     }
 }

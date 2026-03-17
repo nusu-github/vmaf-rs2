@@ -3,7 +3,40 @@
 use crate::dwt::{Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace};
 use crate::score::{score_scale0, score_scale_s123};
 use crate::simd;
+use std::{error::Error, fmt};
 use vmaf_cpu::SimdBackend;
+
+const MIN_FRAME_DIMENSION: usize = 16;
+
+/// Errors produced by [`AdmExtractor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmError {
+    /// Width or height is below the minimum required by the spec kernels.
+    InvalidDimensions { width: usize, height: usize },
+    /// Bit depth is not supported by the integer pipeline.
+    InvalidBitDepth { bpc: u8 },
+    /// Width × height overflowed `usize`.
+    SampleCountOverflow { width: usize, height: usize },
+}
+
+impl fmt::Display for AdmError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDimensions { width, height } => write!(
+                f,
+                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+            ),
+            Self::InvalidBitDepth { bpc } => {
+                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
+            }
+            Self::SampleCountOverflow { width, height } => {
+                write!(f, "sample count overflow for dimensions {width}x{height}")
+            }
+        }
+    }
+}
+
+impl Error for AdmError {}
 
 /// Reusable internal buffers for per-frame ADM extraction.
 #[doc(hidden)]
@@ -44,7 +77,18 @@ pub struct AdmExtractor {
 }
 
 impl AdmExtractor {
-    pub fn new(width: usize, height: usize, bpc: u8, adm_enhn_gain_limit: f64) -> Self {
+    /// Create an ADM extractor for one frame geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdmError`] when dimensions are below the spec minimum, the
+    /// bit depth is unsupported, or the frame area overflows `usize`.
+    pub fn new(
+        width: usize,
+        height: usize,
+        bpc: u8,
+        adm_enhn_gain_limit: f64,
+    ) -> Result<Self, AdmError> {
         Self::with_backend(
             width,
             height,
@@ -61,7 +105,7 @@ impl AdmExtractor {
         bpc: u8,
         adm_enhn_gain_limit: f64,
         backend: SimdBackend,
-    ) -> Self {
+    ) -> Result<Self, AdmError> {
         Self::with_backend(width, height, bpc, adm_enhn_gain_limit, backend)
     }
 
@@ -71,14 +115,15 @@ impl AdmExtractor {
         bpc: u8,
         adm_enhn_gain_limit: f64,
         backend: SimdBackend,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, AdmError> {
+        validate_frame_geometry(width, height, bpc)?;
+        Ok(Self {
             width,
             height,
             bpc,
             adm_enhn_gain_limit,
             backend: simd::effective_backend(backend),
-        }
+        })
     }
 
     #[doc(hidden)]
@@ -210,6 +255,19 @@ impl AdmExtractor {
     }
 }
 
+fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), AdmError> {
+    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
+        return Err(AdmError::InvalidDimensions { width, height });
+    }
+    if !matches!(bpc, 8 | 10 | 12) {
+        return Err(AdmError::InvalidBitDepth { bpc });
+    }
+    width
+        .checked_mul(height)
+        .ok_or(AdmError::SampleCountOverflow { width, height })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,7 +285,8 @@ mod tests {
 
     #[test]
     fn workspace_path_matches_plain_compute() {
-        let extractor = AdmExtractor::with_backend_for_tests(64, 64, 8, 100.0, SimdBackend::Scalar);
+        let extractor =
+            AdmExtractor::with_backend_for_tests(64, 64, 8, 100.0, SimdBackend::Scalar).unwrap();
         let reference = patterned_plane(64, 64, 255, 7);
         let distorted = patterned_plane(64, 64, 255, 23);
         let mut workspace = extractor.make_workspace();
@@ -240,5 +299,27 @@ mod tests {
 
         assert_eq!(plain.to_bits(), reused1.to_bits());
         assert_eq!(plain.to_bits(), reused2.to_bits());
+    }
+
+    #[test]
+    fn constructor_rejects_invalid_dimensions_and_bpc() {
+        assert!(matches!(
+            AdmExtractor::new(15, 16, 8, 100.0),
+            Err(AdmError::InvalidDimensions {
+                width: 15,
+                height: 16
+            })
+        ));
+        assert!(matches!(
+            AdmExtractor::new(16, 15, 8, 100.0),
+            Err(AdmError::InvalidDimensions {
+                width: 16,
+                height: 15
+            })
+        ));
+        assert!(matches!(
+            AdmExtractor::new(16, 16, 9, 100.0),
+            Err(AdmError::InvalidBitDepth { bpc: 9 })
+        ));
     }
 }

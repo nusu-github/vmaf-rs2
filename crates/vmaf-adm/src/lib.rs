@@ -13,7 +13,7 @@ mod score;
 mod simd;
 mod tables;
 
-pub use extractor::{AdmExtractor, AdmWorkspace};
+pub use extractor::{AdmError, AdmExtractor, AdmWorkspace};
 
 #[cfg(test)]
 mod tests {
@@ -312,9 +312,10 @@ mod tests {
         }
 
         let scalar =
-            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, SimdBackend::Scalar);
+            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, SimdBackend::Scalar)
+                .unwrap();
         let simd_backend =
-            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, requested);
+            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, requested).unwrap();
 
         assert_eq!(
             simd_backend.compute_frame(&ref_plane, &dis_plane).to_bits(),

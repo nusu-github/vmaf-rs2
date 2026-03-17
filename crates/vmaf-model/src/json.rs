@@ -142,6 +142,54 @@ fn parse_gain_limit(v: &Value, key: &str, idx: usize) -> Result<f64, String> {
     Ok(n)
 }
 
+fn validate_score_clip(score_clip: [f64; 2]) -> Result<(), String> {
+    let [lower, upper] = score_clip;
+    if lower > upper {
+        return Err(format!(
+            "score_clip lower bound ({lower}) must be <= upper bound ({upper})"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_knots(knots: &[[f64; 2]]) -> Result<(), String> {
+    if knots.len() < 2 {
+        return Err(format!(
+            "score_transform.knots must have at least 2 points, got {}",
+            knots.len()
+        ));
+    }
+
+    for (idx, pair) in knots.windows(2).enumerate() {
+        let [x0, y0] = pair[0];
+        let [x1, y1] = pair[1];
+
+        if x1 <= x0 {
+            return Err(format!(
+                "score_transform.knots x values must be strictly increasing between points {idx} and {}",
+                idx + 1
+            ));
+        }
+
+        if y1 < y0 {
+            return Err(format!(
+                "score_transform.knots y values must be nondecreasing between points {idx} and {}",
+                idx + 1
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_score_transform(st: &ScoreTransformJson) -> Result<(), String> {
+    if let Some(knots) = st.knots.as_deref() {
+        validate_knots(knots)?;
+    }
+
+    Ok(())
+}
+
 /// Parse a VMAF model from its JSON string — spec §3.3.
 pub fn load_model(json: &str) -> Result<VmafModel, String> {
     let root: Root = serde_json::from_str(json).map_err(|e| e.to_string())?;
@@ -223,6 +271,11 @@ pub fn load_model(json: &str) -> Result<VmafModel, String> {
         }
     }
 
+    validate_score_clip(d.score_clip)?;
+    if let Some(score_transform) = d.score_transform.as_ref() {
+        validate_score_transform(score_transform)?;
+    }
+
     let svm = parse_libsvm(&d.model)?;
 
     let feature_slopes = std::array::from_fn(|i| d.slopes[i + 1]);
@@ -286,6 +339,20 @@ mod tests {
             }
         }
     }"#;
+
+    fn with_score_clip(score_clip: &str) -> String {
+        MINIMAL_JSON.replace(
+            "\"score_clip\": [0.0, 100.0]",
+            &format!("\"score_clip\": {score_clip}"),
+        )
+    }
+
+    fn with_score_transform_knots(knots: &str) -> String {
+        MINIMAL_JSON.replace(
+            "\"knots\": [[0.0, 0.0], [100.0, 100.0]]",
+            &format!("\"knots\": {knots}"),
+        )
+    }
 
     #[test]
     fn load_model_parses_svm() {
@@ -382,5 +449,42 @@ mod tests {
             "\"feature_opts_dicts\": [{},{},{\"vif_enhn_gain_limit\": 2.0},{\"vif_enhn_gain_limit\": 2.0},{\"vif_enhn_gain_limit\": 3.0},{\"vif_enhn_gain_limit\": 2.0}],\n            \"slopes\":",
         );
         assert!(load_model(&bad).is_err());
+    }
+
+    #[test]
+    fn load_model_rejects_score_transform_knots_with_too_few_points() {
+        let bad = with_score_transform_knots("[[0.0, 0.0]]");
+        let err = load_model(&bad).err().unwrap();
+        assert!(
+            err.contains("score_transform.knots must have at least 2 points"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn load_model_rejects_score_transform_knots_with_non_increasing_x() {
+        let bad = with_score_transform_knots("[[0.0, 0.0], [0.0, 10.0]]");
+        let err = load_model(&bad).err().unwrap();
+        assert!(
+            err.contains("score_transform.knots x values must be strictly increasing"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn load_model_rejects_score_transform_knots_with_decreasing_y() {
+        let bad = with_score_transform_knots("[[0.0, 0.0], [100.0, -1.0]]");
+        let err = load_model(&bad).err().unwrap();
+        assert!(
+            err.contains("score_transform.knots y values must be nondecreasing"),
+            "got {err}"
+        );
+    }
+
+    #[test]
+    fn load_model_rejects_reversed_score_clip_bounds() {
+        let bad = with_score_clip("[100.0, 0.0]");
+        let err = load_model(&bad).err().unwrap();
+        assert!(err.contains("score_clip lower bound"), "got {err}");
     }
 }

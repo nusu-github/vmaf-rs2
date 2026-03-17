@@ -3,7 +3,60 @@
 use crate::blur::blur_frame_with_backend;
 use crate::sad::compute_sad_with_backend;
 use crate::simd;
+use std::{error::Error, fmt};
 use vmaf_cpu::SimdBackend;
+
+const MIN_FRAME_DIMENSION: usize = 16;
+
+/// Errors produced by [`MotionExtractor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MotionError {
+    /// Width or height is below the minimum required by the spec kernels.
+    InvalidDimensions { width: usize, height: usize },
+    /// Bit depth is not supported by the integer pipeline.
+    InvalidBitDepth { bpc: u8 },
+    /// Width × height or stride × height overflowed `usize`.
+    SampleCountOverflow { width: usize, height: usize },
+    /// The extractor has already been flushed and is now terminal.
+    AlreadyFlushed,
+    /// The provided stride is smaller than the configured frame width.
+    InvalidStride { stride: usize, width: usize },
+    /// The provided input plane is too short for the configured stride and height.
+    InvalidPlaneLength { actual: usize, required: usize },
+    /// A pre-blurred plane did not match the configured frame area.
+    InvalidBlurredPlaneLength { actual: usize, required: usize },
+}
+
+impl fmt::Display for MotionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidDimensions { width, height } => write!(
+                f,
+                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+            ),
+            Self::InvalidBitDepth { bpc } => {
+                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
+            }
+            Self::SampleCountOverflow { width, height } => {
+                write!(f, "sample count overflow for dimensions {width}x{height}")
+            }
+            Self::AlreadyFlushed => write!(f, "motion extractor has already been flushed"),
+            Self::InvalidStride { stride, width } => {
+                write!(f, "invalid stride {stride}: expected at least width {width}")
+            }
+            Self::InvalidPlaneLength { actual, required } => write!(
+                f,
+                "invalid plane length {actual}: expected at least {required} samples"
+            ),
+            Self::InvalidBlurredPlaneLength { actual, required } => write!(
+                f,
+                "invalid blurred plane length {actual}: expected exactly {required} samples"
+            ),
+        }
+    }
+}
+
+impl Error for MotionError {}
 
 /// Stateful motion extractor for a single video sequence.
 ///
@@ -27,10 +80,18 @@ pub struct MotionExtractor {
     frame_count: usize,
     /// motion1 of the last pushed frame (needed for motion2 computation and flush).
     motion1_prev: f32,
+    /// Whether [`flush`] has already made the extractor terminal.
+    flushed: bool,
 }
 
 impl MotionExtractor {
-    pub fn new(width: usize, height: usize, bpc: u8) -> Self {
+    /// Create a motion extractor for one sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MotionError`] when dimensions are below the spec minimum, the
+    /// bit depth is unsupported, or the frame area overflows `usize`.
+    pub fn new(width: usize, height: usize, bpc: u8) -> Result<Self, MotionError> {
         Self::with_backend(width, height, bpc, simd::select_backend())
     }
 
@@ -40,12 +101,18 @@ impl MotionExtractor {
         height: usize,
         bpc: u8,
         backend: SimdBackend,
-    ) -> Self {
+    ) -> Result<Self, MotionError> {
         Self::with_backend(width, height, bpc, backend)
     }
 
-    fn with_backend(width: usize, height: usize, bpc: u8, backend: SimdBackend) -> Self {
-        Self {
+    fn with_backend(
+        width: usize,
+        height: usize,
+        bpc: u8,
+        backend: SimdBackend,
+    ) -> Result<Self, MotionError> {
+        validate_frame_geometry(width, height, bpc)?;
+        Ok(Self {
             width,
             height,
             bpc,
@@ -53,7 +120,8 @@ impl MotionExtractor {
             slots: [Vec::new(), Vec::new(), Vec::new()],
             frame_count: 0,
             motion1_prev: 0.0,
-        }
+            flushed: false,
+        })
     }
 
     /// Push one reference frame.
@@ -63,7 +131,18 @@ impl MotionExtractor {
     ///
     /// Returns `Some((frame_index, motion2_score))` when a score becomes
     /// available, or `None` if more frames are needed.
-    pub fn push_frame(&mut self, luma: &[u16], stride: usize) -> Option<(usize, f32)> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MotionError`] if the extractor has been flushed or the input
+    /// plane shape does not match the configured frame geometry.
+    pub fn push_frame(
+        &mut self,
+        luma: &[u16],
+        stride: usize,
+    ) -> Result<Option<(usize, f32)>, MotionError> {
+        self.ensure_active()?;
+        self.validate_input_plane(luma, stride)?;
         let blurred = self.prepare_blurred_frame(luma, stride);
         self.push_blurred_frame(blurred)
     }
@@ -88,7 +167,18 @@ impl MotionExtractor {
     /// Use [`prepare_blurred_frame`] to compute the blurred frame with this
     /// extractor's cached backend, allowing blur to be computed in parallel
     /// across multiple frames before sequential state update.
-    pub fn push_blurred_frame(&mut self, blurred_luma: Vec<u16>) -> Option<(usize, f32)> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MotionError`] if the extractor has been flushed or the blurred
+    /// frame does not match the configured frame area.
+    pub fn push_blurred_frame(
+        &mut self,
+        blurred_luma: Vec<u16>,
+    ) -> Result<Option<(usize, f32)>, MotionError> {
+        self.ensure_active()?;
+        self.validate_blurred_plane(&blurred_luma)?;
+
         let n = self.frame_count;
         let w = self.width;
         let h = self.height;
@@ -120,16 +210,22 @@ impl MotionExtractor {
 
         self.motion1_prev = motion1_n;
         self.frame_count += 1;
-        result
+        Ok(result)
     }
 
     /// Emit the pending motion2 score for the final frame.
     ///
-    /// Must be called exactly once after all frames have been pushed.
+    /// After the first call, the extractor becomes terminal and subsequent
+    /// calls return `None`.
     ///
     /// Returns `Some((n_last, motion2[n_last]))` when `n_last >= 1`,
     /// `None` for a single-frame sequence (motion2[0] was already emitted).
     pub fn flush(&mut self) -> Option<(usize, f32)> {
+        if self.flushed {
+            return None;
+        }
+        self.flushed = true;
+
         let n_last = self.frame_count.checked_sub(1)?;
         if n_last >= 1 {
             // motion2[n_last] = motion1[n_last] (no subsequent frame to compare)
@@ -138,4 +234,66 @@ impl MotionExtractor {
             None // motion2[0] = 0.0 already emitted by push_frame(0)
         }
     }
+
+    fn frame_len(&self) -> usize {
+        self.width * self.height
+    }
+
+    fn ensure_active(&self) -> Result<(), MotionError> {
+        if self.flushed {
+            return Err(MotionError::AlreadyFlushed);
+        }
+        Ok(())
+    }
+
+    fn validate_input_plane(&self, luma: &[u16], stride: usize) -> Result<(), MotionError> {
+        if stride < self.width {
+            return Err(MotionError::InvalidStride {
+                stride,
+                width: self.width,
+            });
+        }
+
+        let required = checked_sample_count(stride, self.height).map_err(|_| {
+            MotionError::SampleCountOverflow {
+                width: stride,
+                height: self.height,
+            }
+        })?;
+        if luma.len() < required {
+            return Err(MotionError::InvalidPlaneLength {
+                actual: luma.len(),
+                required,
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_blurred_plane(&self, blurred_luma: &[u16]) -> Result<(), MotionError> {
+        let required = self.frame_len();
+        if blurred_luma.len() != required {
+            return Err(MotionError::InvalidBlurredPlaneLength {
+                actual: blurred_luma.len(),
+                required,
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), MotionError> {
+    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
+        return Err(MotionError::InvalidDimensions { width, height });
+    }
+    if !matches!(bpc, 8 | 10 | 12) {
+        return Err(MotionError::InvalidBitDepth { bpc });
+    }
+    checked_sample_count(width, height)?;
+    Ok(())
+}
+
+fn checked_sample_count(width: usize, height: usize) -> Result<usize, MotionError> {
+    width
+        .checked_mul(height)
+        .ok_or(MotionError::SampleCountOverflow { width, height })
 }
