@@ -38,3 +38,7 @@ vmaf-adm = { path = "crates/vmaf-adm" }
 vmaf-motion = { path = "crates/vmaf-motion" }
 vmaf-model = { path = "crates/vmaf-model" }
 vmaf-cpu = { path = "crates/vmaf-cpu" }
+
+[profile.release]
+lto = true
+codegen-units = 1
