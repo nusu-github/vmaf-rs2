@@ -452,6 +452,17 @@ fn process_filtered_pixel(
     let sigma2_sq = (dis_filt as i64 - mu2_sq as i64).max(0);
     let sigma12 = rdi_filt as i64 - mu1_mu2 as i64;
 
+    process_sigma_values(sigma1_sq, sigma2_sq, sigma12, vif_enhn_gain_limit, accum);
+}
+
+#[inline]
+fn process_sigma_values(
+    sigma1_sq: i64,
+    sigma2_sq: i64,
+    sigma12: i64,
+    vif_enhn_gain_limit: f64,
+    accum: &mut RunningStatAccumulators,
+) {
     if sigma1_sq >= SIGMA_NSQ as i64 {
         let sigma1_u32 = sigma1_sq.min(u32::MAX as i64) as u32;
         accum.accum_den_log +=
