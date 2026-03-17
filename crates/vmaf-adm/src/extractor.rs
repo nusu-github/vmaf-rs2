@@ -1,8 +1,9 @@
 //! ADM feature extractor — spec §4.3
 
 use crate::decouple::{decouple_s123, decouple_scale0};
-use crate::dwt::{dwt_s123, dwt_scale0};
 use crate::score::{score_scale0, score_scale_s123};
+use crate::simd;
+use vmaf_cpu::SimdBackend;
 
 /// Stateless ADM extractor: computes the `adm2` score for one reference/distorted frame pair.
 pub struct AdmExtractor {
@@ -10,15 +11,44 @@ pub struct AdmExtractor {
     height: usize,
     bpc: u8,
     adm_enhn_gain_limit: f64,
+    backend: SimdBackend,
 }
 
 impl AdmExtractor {
     pub fn new(width: usize, height: usize, bpc: u8, adm_enhn_gain_limit: f64) -> Self {
+        Self::with_backend(
+            width,
+            height,
+            bpc,
+            adm_enhn_gain_limit,
+            simd::select_backend(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_backend_for_tests(
+        width: usize,
+        height: usize,
+        bpc: u8,
+        adm_enhn_gain_limit: f64,
+        backend: SimdBackend,
+    ) -> Self {
+        Self::with_backend(width, height, bpc, adm_enhn_gain_limit, backend)
+    }
+
+    fn with_backend(
+        width: usize,
+        height: usize,
+        bpc: u8,
+        adm_enhn_gain_limit: f64,
+        backend: SimdBackend,
+    ) -> Self {
         Self {
             width,
             height,
             bpc,
             adm_enhn_gain_limit,
+            backend: simd::effective_backend(backend),
         }
     }
 
@@ -28,10 +58,11 @@ impl AdmExtractor {
     pub fn compute_frame(&self, ref_plane: &[u16], dis_plane: &[u16]) -> f64 {
         let (w, h, bpc) = (self.width, self.height, self.bpc);
         let limit = self.adm_enhn_gain_limit;
+        let backend = self.backend;
 
         // Scale 0 DWT
-        let ref0 = dwt_scale0(ref_plane, w, h, bpc);
-        let dis0 = dwt_scale0(dis_plane, w, h, bpc);
+        let ref0 = simd::dwt_scale0(backend, ref_plane, w, h, bpc);
+        let dis0 = simd::dwt_scale0(backend, dis_plane, w, h, bpc);
         let (w0, h0) = (ref0.width, ref0.height);
         let n0 = w0 * h0;
 
@@ -70,8 +101,8 @@ impl AdmExtractor {
 
         // Scales 1–3
         for scale in 1..=3usize {
-            let ref_s = dwt_s123(&cur_ref_ll, cur_w, cur_h, scale);
-            let dis_s = dwt_s123(&cur_dis_ll, cur_w, cur_h, scale);
+            let ref_s = simd::dwt_s123(backend, &cur_ref_ll, cur_w, cur_h, scale);
+            let dis_s = simd::dwt_s123(backend, &cur_dis_ll, cur_w, cur_h, scale);
             let (ws, hs) = (ref_s.width, ref_s.height);
             let ns = ws * hs;
 

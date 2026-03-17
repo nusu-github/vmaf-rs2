@@ -10,6 +10,7 @@ mod extractor;
 mod math;
 mod noise_floor;
 mod score;
+mod simd;
 mod tables;
 
 pub use extractor::AdmExtractor;
@@ -17,9 +18,12 @@ pub use extractor::AdmExtractor;
 #[cfg(test)]
 mod tests {
     use super::decouple::decouple_scale0;
-    use super::dwt::get_best15_from32;
+    use super::dwt::{dwt_s123, dwt_scale0, get_best15_from32};
+    use super::extractor::AdmExtractor;
     use super::math::reflect_index;
+    use super::simd;
     use super::tables::DIV_LOOKUP;
+    use vmaf_cpu::SimdBackend;
 
     // ── div_lookup §8 conformance ─────────────────────────────────────────────
 
@@ -85,5 +89,118 @@ mod tests {
         assert_eq!(art_v, 0);
         assert_eq!(rst_d, 50);
         assert_eq!(art_d, 10);
+    }
+
+    fn plane_pattern(width: usize, height: usize, max_value: u16) -> Vec<u16> {
+        let modulus = max_value as usize + 1;
+        let mut plane = Vec::with_capacity(width * height);
+        for y in 0..height {
+            for x in 0..width {
+                let value = (x * 37 + y * 53 + (x ^ y) * 11 + (x * y) * 3) % modulus;
+                plane.push(value as u16);
+            }
+        }
+        plane
+    }
+
+    fn ll_pattern(width: usize, height: usize) -> Vec<i32> {
+        let mut ll = Vec::with_capacity(width * height);
+        for idx in 0..(width * height) {
+            let base = ((idx as i32 * 97) % 4096) - 2048;
+            let value = match idx % 5 {
+                0 => base * 31,
+                1 => -base * 17,
+                2 => base * 9 - 777,
+                3 => -base * 5 + 1234,
+                _ => base * 13,
+            };
+            ll.push(value);
+        }
+        ll
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn dwt_scale0_sse2_matches_scalar_on_edges() {
+        if !SimdBackend::X86Sse2.is_available() {
+            return;
+        }
+
+        let width = 11;
+        let height = 7;
+        let bpc = 10;
+        let plane = plane_pattern(width, height, (1u16 << bpc) - 1);
+        let scalar = dwt_scale0(&plane, width, height, bpc);
+        let simd = simd::dwt_scale0(SimdBackend::X86Sse2, &plane, width, height, bpc);
+
+        assert_eq!(simd, scalar);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn dwt_scale0_avx2_matches_scalar_on_odd_frames() {
+        if !SimdBackend::X86Avx2Fma.is_available() {
+            return;
+        }
+
+        let width = 33;
+        let height = 19;
+        let bpc = 12;
+        let plane = plane_pattern(width, height, (1u16 << bpc) - 1);
+        let scalar = dwt_scale0(&plane, width, height, bpc);
+        let simd = simd::dwt_scale0(SimdBackend::X86Avx2Fma, &plane, width, height, bpc);
+
+        assert_eq!(simd, scalar);
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn dwt_s123_avx2_matches_scalar_across_scales() {
+        if !SimdBackend::X86Avx2Fma.is_available() {
+            return;
+        }
+
+        let width = 21;
+        let height = 15;
+        let ll = ll_pattern(width, height);
+
+        for scale in 1..=3 {
+            let scalar = dwt_s123(&ll, width, height, scale);
+            let simd = simd::dwt_s123(SimdBackend::X86Avx2Fma, &ll, width, height, scale);
+            assert_eq!(simd, scalar, "scale {scale} mismatch");
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn adm_extractor_backend_matches_scalar() {
+        let requested = if SimdBackend::X86Avx2Fma.is_available() {
+            SimdBackend::X86Avx2Fma
+        } else if SimdBackend::X86Sse2.is_available() {
+            SimdBackend::X86Sse2
+        } else {
+            return;
+        };
+
+        let width = 27;
+        let height = 19;
+        let bpc = 10;
+        let max_value = (1u16 << bpc) - 1;
+        let ref_plane = plane_pattern(width, height, max_value);
+        let mut dis_plane = plane_pattern(width, height, max_value);
+        for (idx, value) in dis_plane.iter_mut().enumerate() {
+            let delta = ((idx * 7 + 13) % 19) as u16;
+            *value = value.saturating_sub(delta / 2).min(max_value);
+        }
+
+        let scalar =
+            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, SimdBackend::Scalar);
+        let simd_backend =
+            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, requested);
+
+        assert_eq!(
+            simd_backend.compute_frame(&ref_plane, &dis_plane).to_bits(),
+            scalar.compute_frame(&ref_plane, &dis_plane).to_bits(),
+        );
     }
 }
