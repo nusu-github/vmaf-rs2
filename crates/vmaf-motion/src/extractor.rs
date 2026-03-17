@@ -1,7 +1,9 @@
 //! MotionExtractor: ring-buffer state machine — spec §4.4.2
 
-use crate::blur::blur_frame;
-use crate::sad::compute_sad;
+use crate::blur::blur_frame_with_backend;
+use crate::sad::compute_sad_with_backend;
+use crate::simd;
+use vmaf_cpu::SimdBackend;
 
 /// Stateful motion extractor for a single video sequence.
 ///
@@ -18,6 +20,7 @@ pub struct MotionExtractor {
     width: usize,
     height: usize,
     bpc: u8,
+    backend: SimdBackend,
     /// Three blurred-frame slots; slot `n % 3` holds frame `n`.
     slots: [Vec<u16>; 3],
     /// Number of frames pushed so far.
@@ -28,11 +31,26 @@ pub struct MotionExtractor {
 
 impl MotionExtractor {
     pub fn new(width: usize, height: usize, bpc: u8) -> Self {
+        Self::with_backend(width, height, bpc, simd::select_backend())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_backend_for_tests(
+        width: usize,
+        height: usize,
+        bpc: u8,
+        backend: SimdBackend,
+    ) -> Self {
+        Self::with_backend(width, height, bpc, backend)
+    }
+
+    fn with_backend(width: usize, height: usize, bpc: u8, backend: SimdBackend) -> Self {
         let empty = vec![0u16; width * height];
         Self {
             width,
             height,
             bpc,
+            backend: simd::effective_backend(backend),
             slots: [empty.clone(), empty.clone(), empty],
             frame_count: 0,
             motion1_prev: 0.0,
@@ -47,14 +65,30 @@ impl MotionExtractor {
     /// Returns `Some((frame_index, motion2_score))` when a score becomes
     /// available, or `None` if more frames are needed.
     pub fn push_frame(&mut self, luma: &[u16], stride: usize) -> Option<(usize, f32)> {
-        let blurred = blur_frame(luma, stride, self.width, self.height, self.bpc);
+        let blurred = self.prepare_blurred_frame(luma, stride);
         self.push_blurred_frame(blurred)
+    }
+
+    /// Blur one reference frame using the extractor's cached backend selection.
+    ///
+    /// This is intended for batch workflows that precompute blur in parallel and
+    /// later feed the result into [`push_blurred_frame`].
+    pub fn prepare_blurred_frame(&self, luma: &[u16], stride: usize) -> Vec<u16> {
+        blur_frame_with_backend(
+            self.backend,
+            luma,
+            stride,
+            self.width,
+            self.height,
+            self.bpc,
+        )
     }
 
     /// Push a pre-computed blurred reference frame.
     ///
-    /// This bypasses the internal blur calculation, allowing the blur to be
-    /// computed in parallel across multiple frames before sequential state update.
+    /// Use [`prepare_blurred_frame`] to compute the blurred frame with this
+    /// extractor's cached backend, allowing blur to be computed in parallel
+    /// across multiple frames before sequential state update.
     pub fn push_blurred_frame(&mut self, blurred_luma: Vec<u16>) -> Option<(usize, f32)> {
         let n = self.frame_count;
         let w = self.width;
@@ -67,7 +101,13 @@ impl MotionExtractor {
             0.0_f32
         } else {
             // Compare current frame (slot n%3) with one-back (slot (n+2)%3).
-            compute_sad(&self.slots[(n + 2) % 3], &self.slots[n % 3], w, h)
+            compute_sad_with_backend(
+                self.backend,
+                &self.slots[(n + 2) % 3],
+                &self.slots[n % 3],
+                w,
+                h,
+            )
         };
 
         let result = if n == 0 {

@@ -3,5 +3,6 @@ name    = "vmaf-motion"
 version = "0.1.0"
 edition = "2021"
 
-# §4.4 Integer Motion — no external deps
+# §4.4 Integer Motion — shared CPU backend selection for runtime SIMD dispatch.
 [dependencies]
+vmaf-cpu = { workspace = true }
