@@ -98,6 +98,16 @@ impl VmafContext {
     /// Push a batch of reference/distorted frame pairs in parallel.
     /// Returns a list of `FrameScore`s that have become available.
     pub fn push_frame_batch(&mut self, frames: &[(&[u16], &[u16])]) -> Vec<FrameScore> {
+        if frames.len() <= 1 || rayon::current_num_threads() <= 1 {
+            let mut out = Vec::with_capacity(frames.len());
+            for &(reference, distorted) in frames {
+                if let Some(score) = self.push_frame(reference, distorted) {
+                    out.push(score);
+                }
+            }
+            return out;
+        }
+
         use rayon::prelude::*;
 
         let vif = &self.vif;
@@ -381,6 +391,88 @@ mod tests {
         batch_scores.extend(batch.push_frame_batch(&batch_inputs_b));
         batch_scores.extend(batch.push_frame_batch(&batch_inputs_c));
         if let Some(score) = batch.flush() {
+            batch_scores.push(score);
+        }
+
+        assert_eq!(sequential_scores.len(), batch_scores.len());
+
+        for (sequential_score, batch_score) in sequential_scores.iter().zip(&batch_scores) {
+            assert_eq!(sequential_score.frame_index, batch_score.frame_index);
+            assert_eq!(
+                sequential_score.score.to_bits(),
+                batch_score.score.to_bits()
+            );
+            assert_eq!(sequential_score.adm2.to_bits(), batch_score.adm2.to_bits());
+            assert_eq!(
+                sequential_score.motion2.to_bits(),
+                batch_score.motion2.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale0.to_bits(),
+                batch_score.vif_scale0.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale1.to_bits(),
+                batch_score.vif_scale1.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale2.to_bits(),
+                batch_score.vif_scale2.to_bits()
+            );
+            assert_eq!(
+                sequential_score.vif_scale3.to_bits(),
+                batch_score.vif_scale3.to_bits()
+            );
+        }
+    }
+
+    #[test]
+    fn batch_path_matches_sequential_inside_single_thread_pool() {
+        let model_json = include_str!("../../../models/vmaf_v0.6.1.json");
+        let (w, h, bpc) = (48usize, 32usize, 8u8);
+
+        let frames: Vec<(Vec<u16>, Vec<u16>)> = (0..4usize)
+            .map(|frame_idx| {
+                let reference: Vec<u16> = (0..h)
+                    .flat_map(|y| {
+                        (0..w)
+                            .map(move |x| ((x * 9 + y * 7 + frame_idx * 13 + (x ^ y)) % 256) as u16)
+                    })
+                    .collect();
+                let distorted = reference
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, &value)| {
+                        value.saturating_sub(((frame_idx * 5 + idx * 11 + idx / w) % 23) as u16)
+                    })
+                    .collect();
+                (reference, distorted)
+            })
+            .collect();
+
+        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc);
+        let mut single_thread_batch = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc);
+
+        let mut sequential_scores = Vec::new();
+        for (reference, distorted) in &frames {
+            if let Some(score) = sequential.push_frame(reference, distorted) {
+                sequential_scores.push(score);
+            }
+        }
+        if let Some(score) = sequential.flush() {
+            sequential_scores.push(score);
+        }
+
+        let batch_inputs: Vec<_> = frames
+            .iter()
+            .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
+            .collect();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let mut batch_scores = pool.install(|| single_thread_batch.push_frame_batch(&batch_inputs));
+        if let Some(score) = single_thread_batch.flush() {
             batch_scores.push(score);
         }
 
