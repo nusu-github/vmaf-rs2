@@ -5,6 +5,8 @@
 
 #![allow(clippy::too_many_arguments, clippy::type_complexity)]
 
+use std::mem::MaybeUninit;
+
 use crate::decouple::{decouple_s123, decouple_scale0};
 use crate::noise_floor;
 
@@ -59,6 +61,15 @@ fn scale123_rfactor_fp(rfactor: [f32; 3]) -> [u32; 3] {
         (rfactor[1] as f64 * pow2_32) as u32,
         (rfactor[2] as f64 * pow2_32) as u32,
     ]
+}
+
+#[inline]
+fn prepare_row_storage<T>(vec: &mut Vec<T>, len: usize) -> &mut [MaybeUninit<T>] {
+    vec.clear();
+    if vec.capacity() < len {
+        vec.reserve(len - vec.capacity());
+    }
+    &mut vec.spare_capacity_mut()[..len]
 }
 
 #[inline]
@@ -145,15 +156,26 @@ impl AdmCmScale0Row {
         debug_assert_eq!(dis_v.len(), width);
         debug_assert_eq!(dis_d.len(), width);
 
-        self.scaled_h.clear();
-        self.scaled_v.clear();
-        self.scaled_d.clear();
-        self.csf_a_h.clear();
-        self.csf_a_v.clear();
-        self.csf_a_d.clear();
-        self.csf_f_h.clear();
-        self.csf_f_v.clear();
-        self.csf_f_d.clear();
+        let Self {
+            scaled_h,
+            scaled_v,
+            scaled_d,
+            csf_a_h,
+            csf_a_v,
+            csf_a_d,
+            csf_f_h,
+            csf_f_v,
+            csf_f_d,
+        } = self;
+        let scaled_h_out = prepare_row_storage(scaled_h, width);
+        let scaled_v_out = prepare_row_storage(scaled_v, width);
+        let scaled_d_out = prepare_row_storage(scaled_d, width);
+        let csf_a_h_out = prepare_row_storage(csf_a_h, width);
+        let csf_a_v_out = prepare_row_storage(csf_a_v, width);
+        let csf_a_d_out = prepare_row_storage(csf_a_d, width);
+        let csf_f_h_out = prepare_row_storage(csf_f_h, width);
+        let csf_f_v_out = prepare_row_storage(csf_f_v, width);
+        let csf_f_d_out = prepare_row_storage(csf_f_d, width);
 
         for k in 0..width {
             let (rst_h, rst_v, rst_d, art_h, art_v, art_d) = decouple_scale0(
@@ -167,15 +189,28 @@ impl AdmCmScale0Row {
             );
             let (csf_a, csf_f) = csf_scale0_triplet(art_h, art_v, art_d);
 
-            self.scaled_h.push(rst_h as i32 * SCALE0_CSF_RFACTOR[0]);
-            self.scaled_v.push(rst_v as i32 * SCALE0_CSF_RFACTOR[1]);
-            self.scaled_d.push(rst_d as i32 * SCALE0_CSF_RFACTOR[2]);
-            self.csf_a_h.push(csf_a[0]);
-            self.csf_a_v.push(csf_a[1]);
-            self.csf_a_d.push(csf_a[2]);
-            self.csf_f_h.push(csf_f[0]);
-            self.csf_f_v.push(csf_f[1]);
-            self.csf_f_d.push(csf_f[2]);
+            scaled_h_out[k].write(rst_h as i32 * SCALE0_CSF_RFACTOR[0]);
+            scaled_v_out[k].write(rst_v as i32 * SCALE0_CSF_RFACTOR[1]);
+            scaled_d_out[k].write(rst_d as i32 * SCALE0_CSF_RFACTOR[2]);
+            csf_a_h_out[k].write(csf_a[0]);
+            csf_a_v_out[k].write(csf_a[1]);
+            csf_a_d_out[k].write(csf_a[2]);
+            csf_f_h_out[k].write(csf_f[0]);
+            csf_f_v_out[k].write(csf_f[1]);
+            csf_f_d_out[k].write(csf_f[2]);
+        }
+
+        // SAFETY: every slot in each spare-capacity slice above is written exactly once.
+        unsafe {
+            scaled_h.set_len(width);
+            scaled_v.set_len(width);
+            scaled_d.set_len(width);
+            csf_a_h.set_len(width);
+            csf_a_v.set_len(width);
+            csf_a_d.set_len(width);
+            csf_f_h.set_len(width);
+            csf_f_v.set_len(width);
+            csf_f_d.set_len(width);
         }
     }
 }
@@ -225,15 +260,26 @@ impl AdmCmScale123Row {
         debug_assert_eq!(dis_v.len(), width);
         debug_assert_eq!(dis_d.len(), width);
 
-        self.scaled_h.clear();
-        self.scaled_v.clear();
-        self.scaled_d.clear();
-        self.csf_a_h.clear();
-        self.csf_a_v.clear();
-        self.csf_a_d.clear();
-        self.csf_f_h.clear();
-        self.csf_f_v.clear();
-        self.csf_f_d.clear();
+        let Self {
+            scaled_h,
+            scaled_v,
+            scaled_d,
+            csf_a_h,
+            csf_a_v,
+            csf_a_d,
+            csf_f_h,
+            csf_f_v,
+            csf_f_d,
+        } = self;
+        let scaled_h_out = prepare_row_storage(scaled_h, width);
+        let scaled_v_out = prepare_row_storage(scaled_v, width);
+        let scaled_d_out = prepare_row_storage(scaled_d, width);
+        let csf_a_h_out = prepare_row_storage(csf_a_h, width);
+        let csf_a_v_out = prepare_row_storage(csf_a_v, width);
+        let csf_a_d_out = prepare_row_storage(csf_a_d, width);
+        let csf_f_h_out = prepare_row_storage(csf_f_h, width);
+        let csf_f_v_out = prepare_row_storage(csf_f_v, width);
+        let csf_f_d_out = prepare_row_storage(csf_f_d, width);
 
         for k in 0..width {
             let (rst_h, rst_v, rst_d, art_h, art_v, art_d) = decouple_s123(
@@ -247,24 +293,37 @@ impl AdmCmScale123Row {
             );
             let (csf_a, csf_f) = csf_s123_triplet(art_h, art_v, art_d, i_rfactor);
 
-            self.scaled_h.push(
+            scaled_h_out[k].write(
                 (((rst_h as i64) * (i_rfactor[0] as i64) + S123_ADD_BEFORE_SHIFT_DST)
                     >> S123_SHIFT_DST) as i32,
             );
-            self.scaled_v.push(
+            scaled_v_out[k].write(
                 (((rst_v as i64) * (i_rfactor[1] as i64) + S123_ADD_BEFORE_SHIFT_DST)
                     >> S123_SHIFT_DST) as i32,
             );
-            self.scaled_d.push(
+            scaled_d_out[k].write(
                 (((rst_d as i64) * (i_rfactor[2] as i64) + S123_ADD_BEFORE_SHIFT_DST)
                     >> S123_SHIFT_DST) as i32,
             );
-            self.csf_a_h.push(csf_a[0]);
-            self.csf_a_v.push(csf_a[1]);
-            self.csf_a_d.push(csf_a[2]);
-            self.csf_f_h.push(csf_f[0]);
-            self.csf_f_v.push(csf_f[1]);
-            self.csf_f_d.push(csf_f[2]);
+            csf_a_h_out[k].write(csf_a[0]);
+            csf_a_v_out[k].write(csf_a[1]);
+            csf_a_d_out[k].write(csf_a[2]);
+            csf_f_h_out[k].write(csf_f[0]);
+            csf_f_v_out[k].write(csf_f[1]);
+            csf_f_d_out[k].write(csf_f[2]);
+        }
+
+        // SAFETY: every slot in each spare-capacity slice above is written exactly once.
+        unsafe {
+            scaled_h.set_len(width);
+            scaled_v.set_len(width);
+            scaled_d.set_len(width);
+            csf_a_h.set_len(width);
+            csf_a_v.set_len(width);
+            csf_a_d.set_len(width);
+            csf_f_h.set_len(width);
+            csf_f_v.set_len(width);
+            csf_f_d.set_len(width);
         }
     }
 }
