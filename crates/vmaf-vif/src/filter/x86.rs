@@ -1,10 +1,11 @@
-use vmaf_cpu::{Align32, AlignedScratch, SimdBackend};
+use vmaf_cpu::SimdBackend;
 
 use crate::tables::{FILTER, FILTER_WIDTH};
 
 use super::{
-    decimate_filtered, horizontal_scalar_range, horizontal_simd_body_range, reflected_row_offsets,
-    vertical_scalar_range, HORIZONTAL_ROUND, HORIZONTAL_SHIFT,
+    decimate_filtered_into, horizontal_scalar_range, horizontal_simd_body_range,
+    reflected_row_offsets, vertical_scalar_range, SubsampleWorkspace, FILTER_TAP_CAP,
+    HORIZONTAL_ROUND, HORIZONTAL_SHIFT,
 };
 
 #[cfg(target_arch = "x86")]
@@ -17,7 +18,7 @@ enum X86FilterKernel {
     Avx2,
 }
 
-pub(super) fn subsample(
+pub(super) fn subsample_into(
     ref_in: &[u16],
     dis_in: &[u16],
     width: usize,
@@ -25,7 +26,10 @@ pub(super) fn subsample(
     bpc: u8,
     scale: usize,
     backend: SimdBackend,
-) -> (Vec<u16>, Vec<u16>, usize, usize) {
+    workspace: &mut SubsampleWorkspace,
+    out_ref: &mut Vec<u16>,
+    out_dis: &mut Vec<u16>,
+) -> (usize, usize) {
     let filt = &FILTER[scale + 1][..FILTER_WIDTH[scale + 1]];
     let half = filt.len() / 2;
     let (shift_v, round_v) = if scale == 0 {
@@ -33,15 +37,13 @@ pub(super) fn subsample(
     } else {
         (16u32, 32768u32)
     };
+    let frame_len = height * width;
 
-    let mut tmp_ref_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let mut tmp_dis_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let mut filt_ref_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let mut filt_dis_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let tmp_ref = tmp_ref_buf.as_mut_slice();
-    let tmp_dis = tmp_dis_buf.as_mut_slice();
-    let filt_ref = filt_ref_buf.as_mut_slice();
-    let filt_dis = filt_dis_buf.as_mut_slice();
+    workspace.prepare(frame_len);
+    let tmp_ref = &mut workspace.tmp_ref.as_mut_slice()[..frame_len];
+    let tmp_dis = &mut workspace.tmp_dis.as_mut_slice()[..frame_len];
+    let filt_ref = &mut workspace.filt_ref.as_mut_slice()[..frame_len];
+    let filt_dis = &mut workspace.filt_dis.as_mut_slice()[..frame_len];
 
     match select_kernel(backend) {
         X86FilterKernel::Avx2 => {
@@ -70,7 +72,7 @@ pub(super) fn subsample(
         }
     }
 
-    decimate_filtered(filt_ref, filt_dis, width, height)
+    decimate_filtered_into(filt_ref, filt_dis, width, height, out_ref, out_dis)
 }
 
 #[inline]

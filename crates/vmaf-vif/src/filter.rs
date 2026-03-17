@@ -12,6 +12,47 @@ const FILTER_TAP_CAP: usize = 18;
 const HORIZONTAL_SHIFT: u32 = 16;
 const HORIZONTAL_ROUND: u32 = 32768;
 
+/// Reusable aligned buffers for one subsampling step.
+#[derive(Debug)]
+pub(crate) struct SubsampleWorkspace {
+    tmp_ref: AlignedScratch<u16, Align32>,
+    tmp_dis: AlignedScratch<u16, Align32>,
+    filt_ref: AlignedScratch<u16, Align32>,
+    filt_dis: AlignedScratch<u16, Align32>,
+}
+
+impl Default for SubsampleWorkspace {
+    fn default() -> Self {
+        Self::new(0)
+    }
+}
+
+impl SubsampleWorkspace {
+    pub(crate) fn new(max_frame_len: usize) -> Self {
+        Self {
+            tmp_ref: AlignedScratch::zeroed(max_frame_len),
+            tmp_dis: AlignedScratch::zeroed(max_frame_len),
+            filt_ref: AlignedScratch::zeroed(max_frame_len),
+            filt_dis: AlignedScratch::zeroed(max_frame_len),
+        }
+    }
+
+    fn prepare(&mut self, frame_len: usize) {
+        if self.tmp_ref.len() < frame_len {
+            self.tmp_ref = AlignedScratch::zeroed(frame_len);
+        }
+        if self.tmp_dis.len() < frame_len {
+            self.tmp_dis = AlignedScratch::zeroed(frame_len);
+        }
+        if self.filt_ref.len() < frame_len {
+            self.filt_ref = AlignedScratch::zeroed(frame_len);
+        }
+        if self.filt_dis.len() < frame_len {
+            self.filt_dis = AlignedScratch::zeroed(frame_len);
+        }
+    }
+}
+
 /// Low-pass filter a pair of planes and decimate 2:1 (scale s → scale s+1).
 ///
 /// Uses `FILTER[scale + 1]` (the subsampling filter for the next scale).
@@ -25,30 +66,70 @@ pub(crate) fn subsample(
     scale: usize,
     backend: SimdBackend,
 ) -> (Vec<u16>, Vec<u16>, usize, usize) {
-    match backend {
-        SimdBackend::Scalar => subsample_scalar(ref_in, dis_in, width, height, bpc, scale),
-        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
-        SimdBackend::X86Sse2 | SimdBackend::X86Avx2Fma | SimdBackend::X86Avx512 => {
-            x86::subsample(ref_in, dis_in, width, height, bpc, scale, backend)
-        }
-        SimdBackend::Aarch64Neon => {
-            aarch64::subsample(ref_in, dis_in, width, height, bpc, scale, backend)
-        }
-        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
-        _ => subsample_scalar(ref_in, dis_in, width, height, bpc, scale),
-    }
+    let mut workspace = SubsampleWorkspace::new(width * height);
+    let mut out_ref = Vec::with_capacity((width / 2) * (height / 2));
+    let mut out_dis = Vec::with_capacity((width / 2) * (height / 2));
+    let (out_width, out_height) = subsample_into(
+        ref_in,
+        dis_in,
+        width,
+        height,
+        bpc,
+        scale,
+        backend,
+        &mut workspace,
+        &mut out_ref,
+        &mut out_dis,
+    );
+    (out_ref, out_dis, out_width, out_height)
 }
 
-fn subsample_scalar(
+pub(crate) fn subsample_into(
     ref_in: &[u16],
     dis_in: &[u16],
     width: usize,
     height: usize,
     bpc: u8,
     scale: usize,
-) -> (Vec<u16>, Vec<u16>, usize, usize) {
+    backend: SimdBackend,
+    workspace: &mut SubsampleWorkspace,
+    out_ref: &mut Vec<u16>,
+    out_dis: &mut Vec<u16>,
+) -> (usize, usize) {
+    match backend {
+        SimdBackend::Scalar => subsample_scalar_into(
+            ref_in, dis_in, width, height, bpc, scale, workspace, out_ref, out_dis,
+        ),
+        #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+        SimdBackend::X86Sse2 | SimdBackend::X86Avx2Fma | SimdBackend::X86Avx512 => {
+            x86::subsample_into(
+                ref_in, dis_in, width, height, bpc, scale, backend, workspace, out_ref, out_dis,
+            )
+        }
+        SimdBackend::Aarch64Neon => aarch64::subsample_into(
+            ref_in, dis_in, width, height, bpc, scale, backend, workspace, out_ref, out_dis,
+        ),
+        #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+        _ => subsample_scalar_into(
+            ref_in, dis_in, width, height, bpc, scale, workspace, out_ref, out_dis,
+        ),
+    }
+}
+
+fn subsample_scalar_into(
+    ref_in: &[u16],
+    dis_in: &[u16],
+    width: usize,
+    height: usize,
+    bpc: u8,
+    scale: usize,
+    workspace: &mut SubsampleWorkspace,
+    out_ref: &mut Vec<u16>,
+    out_dis: &mut Vec<u16>,
+) -> (usize, usize) {
     let filt = &FILTER[scale + 1][..FILTER_WIDTH[scale + 1]];
     let half = filt.len() / 2;
+    let frame_len = width * height;
 
     let (shift_v, round_v) = if scale == 0 {
         (bpc as u32, 1u32 << (bpc - 1))
@@ -56,14 +137,11 @@ fn subsample_scalar(
         (16u32, 32768u32)
     };
 
-    let mut tmp_ref_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let mut tmp_dis_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let mut filt_ref_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let mut filt_dis_buf = AlignedScratch::<u16, Align32>::zeroed(height * width);
-    let tmp_ref = tmp_ref_buf.as_mut_slice();
-    let tmp_dis = tmp_dis_buf.as_mut_slice();
-    let filt_ref = filt_ref_buf.as_mut_slice();
-    let filt_dis = filt_dis_buf.as_mut_slice();
+    workspace.prepare(frame_len);
+    let tmp_ref = &mut workspace.tmp_ref.as_mut_slice()[..frame_len];
+    let tmp_dis = &mut workspace.tmp_dis.as_mut_slice()[..frame_len];
+    let filt_ref = &mut workspace.filt_ref.as_mut_slice()[..frame_len];
+    let filt_dis = &mut workspace.filt_dis.as_mut_slice()[..frame_len];
 
     for i in 0..height {
         let row_offsets = reflected_row_offsets(i, height, width, half, filt.len());
@@ -96,7 +174,7 @@ fn subsample_scalar(
         );
     }
 
-    decimate_filtered(filt_ref, filt_dis, width, height)
+    decimate_filtered_into(filt_ref, filt_dis, width, height, out_ref, out_dis)
 }
 
 #[inline]
@@ -189,23 +267,96 @@ fn horizontal_simd_body_range(width: usize, half: usize, lanes: usize) -> (usize
 }
 
 #[inline]
-fn decimate_filtered(
+fn decimate_filtered_into(
     filt_ref: &[u16],
     filt_dis: &[u16],
     width: usize,
     height: usize,
-) -> (Vec<u16>, Vec<u16>, usize, usize) {
+    out_ref: &mut Vec<u16>,
+    out_dis: &mut Vec<u16>,
+) -> (usize, usize) {
     let out_w = width / 2;
     let out_h = height / 2;
-    let mut out_ref = vec![0u16; out_h * out_w];
-    let mut out_dis = vec![0u16; out_h * out_w];
+    let out_len = out_h * out_w;
+
+    out_ref.resize(out_len, 0);
+    out_dis.resize(out_len, 0);
 
     for i in 0..out_h {
         for j in 0..out_w {
-            out_ref[i * out_w + j] = filt_ref[(2 * i) * width + (2 * j)];
-            out_dis[i * out_w + j] = filt_dis[(2 * i) * width + (2 * j)];
+            let dst = i * out_w + j;
+            out_ref[dst] = filt_ref[(2 * i) * width + (2 * j)];
+            out_dis[dst] = filt_dis[(2 * i) * width + (2 * j)];
         }
     }
 
-    (out_ref, out_dis, out_w, out_h)
+    (out_w, out_h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmaf_cpu::SimdBackend;
+
+    fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    ((x * 11 + y * 17 + (x ^ y) * 5 + x * y * 3 + bias) % modulus as usize) as u16
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_path_matches_owned_wrapper() {
+        let width = 23;
+        let height = 19;
+        let reference = patterned_plane(width, height, 1024, 7);
+        let distorted = patterned_plane(width, height, 1024, 29);
+        let expected = subsample(
+            &reference,
+            &distorted,
+            width,
+            height,
+            10,
+            0,
+            SimdBackend::Scalar,
+        );
+
+        let mut workspace = SubsampleWorkspace::new(width * height);
+        let mut out_ref = Vec::new();
+        let mut out_dis = Vec::new();
+        let dims = subsample_into(
+            &reference,
+            &distorted,
+            width,
+            height,
+            10,
+            0,
+            SimdBackend::Scalar,
+            &mut workspace,
+            &mut out_ref,
+            &mut out_dis,
+        );
+        assert_eq!((expected.2, expected.3), dims);
+        assert_eq!(expected.0, out_ref);
+        assert_eq!(expected.1, out_dis);
+
+        let dims2 = subsample_into(
+            &reference,
+            &distorted,
+            width,
+            height,
+            10,
+            0,
+            SimdBackend::Scalar,
+            &mut workspace,
+            &mut out_ref,
+            &mut out_dis,
+        );
+        assert_eq!((expected.2, expected.3), dims2);
+        assert_eq!(expected.0, out_ref);
+        assert_eq!(expected.1, out_dis);
+    }
 }
