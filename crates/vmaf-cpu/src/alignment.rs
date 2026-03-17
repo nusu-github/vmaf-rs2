@@ -161,6 +161,17 @@ pub struct AlignedScratch<T, A: Alignment> {
     _align: PhantomData<A>,
 }
 
+// SAFETY: `AlignedScratch` uniquely owns its allocation and never shares mutable
+// access without `&mut self`. Moving the buffer to another thread only moves the
+// owned pointer/length pair, so this is sound whenever the stored elements can
+// themselves be transferred across threads.
+unsafe impl<T: Send, A: Alignment + Send> Send for AlignedScratch<T, A> {}
+
+// SAFETY: shared references only expose `&[T]`, and mutable access still
+// requires `&mut self`. The raw pointer is owned by the buffer, so concurrent
+// reads are sound whenever `T` is `Sync`.
+unsafe impl<T: Sync, A: Alignment + Sync> Sync for AlignedScratch<T, A> {}
+
 impl<T, A: Alignment> AlignedScratch<T, A> {
     /// Returns the effective alignment in bytes.
     pub fn alignment() -> usize {
@@ -416,5 +427,16 @@ mod tests {
         // SAFETY: every slot was written in the loop above.
         let scratch = unsafe { scratch.assume_init() };
         assert_eq!(scratch.as_slice(), &[0, 3, 6, 9, 12, 15, 18, 21]);
+    }
+
+    #[test]
+    fn aligned_scratch_is_send_and_sync_when_element_type_is() {
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+
+        assert_send::<AlignedScratch<u16, Align32>>();
+        assert_sync::<AlignedScratch<u16, Align32>>();
+        assert_send::<AlignedScratch<MaybeUninit<u16>, Align32>>();
+        assert_sync::<AlignedScratch<MaybeUninit<u16>, Align32>>();
     }
 }
