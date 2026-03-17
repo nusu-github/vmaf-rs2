@@ -7,11 +7,16 @@ members = [
     "crates/vmaf-motion",
     "crates/vmaf-model",
     "crates/vmaf-cli",
+    "crates/vmaf-cpu",
 ]
 
 [workspace.dependencies]
 # Math
 libm = "0.2"
+
+# CPU / SIMD foundation
+bytemuck = "1.24"
+cpufeatures = "0.2"
 
 # JSON parsing
 serde = { version = "1.0", features = ["derive"] }
@@ -32,3 +37,4 @@ vmaf-vif = { path = "crates/vmaf-vif" }
 vmaf-adm = { path = "crates/vmaf-adm" }
 vmaf-motion = { path = "crates/vmaf-motion" }
 vmaf-model = { path = "crates/vmaf-model" }
+vmaf-cpu = { path = "crates/vmaf-cpu" }

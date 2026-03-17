@@ -1,0 +1,9 @@
+[package]
+name = "vmaf-cpu"
+version = "0.1.0"
+edition = "2021"
+
+# Shared CPU feature detection, backend selection, and alignment helpers.
+[dependencies]
+bytemuck = { workspace = true }
+cpufeatures = { workspace = true }
