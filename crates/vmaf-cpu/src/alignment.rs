@@ -1,7 +1,7 @@
-use std::alloc::{alloc_zeroed, dealloc, handle_alloc_error, Layout};
+use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
 use std::fmt;
 use std::marker::PhantomData;
-use std::mem::{align_of, size_of};
+use std::mem::{align_of, size_of, ManuallyDrop, MaybeUninit};
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 use std::slice;
@@ -256,6 +256,71 @@ impl<T: Zeroable, A: Alignment> AlignedScratch<T, A> {
     }
 }
 
+impl<T, A: Alignment> AlignedScratch<MaybeUninit<T>, A> {
+    /// Allocates an uninitialized aligned scratch buffer.
+    ///
+    /// The returned buffer is safe to write through as a
+    /// `&mut [MaybeUninit<T>]`. Call [`Self::assume_init`] only after every
+    /// element has been fully initialized with a valid `T`.
+    pub fn try_uninit(len: usize) -> Result<Self, AlignedAllocError> {
+        let layout = Self::layout(len)?;
+        if layout.size() == 0 {
+            return Ok(Self {
+                ptr: NonNull::dangling(),
+                len,
+                _align: PhantomData,
+            });
+        }
+
+        // SAFETY: `layout` was validated above. `alloc` returns a pointer
+        // suitable for deallocation with the same layout, and
+        // `MaybeUninit<T>` permits uninitialized bytes.
+        let ptr = unsafe { alloc(layout) };
+        let Some(ptr) = NonNull::new(ptr.cast::<MaybeUninit<T>>()) else {
+            return Err(AlignedAllocError::AllocationFailed {
+                size: layout.size(),
+                align: layout.align(),
+            });
+        };
+
+        Ok(Self {
+            ptr,
+            len,
+            _align: PhantomData,
+        })
+    }
+
+    /// Allocates an uninitialized aligned scratch buffer or aborts on OOM.
+    pub fn uninit(len: usize) -> Self {
+        match Self::try_uninit(len) {
+            Ok(scratch) => scratch,
+            Err(AlignedAllocError::LayoutOverflow) => {
+                panic!("aligned scratch layout overflow for {len} elements")
+            }
+            Err(AlignedAllocError::AllocationFailed { size, align }) => {
+                let layout =
+                    Layout::from_size_align(size, align).expect("saved allocation layout is valid");
+                handle_alloc_error(layout);
+            }
+        }
+    }
+
+    /// Converts an uninitialized scratch buffer into initialized storage.
+    ///
+    /// # Safety
+    ///
+    /// Every element in the buffer must have been written with a valid `T`
+    /// before calling this function.
+    pub unsafe fn assume_init(self) -> AlignedScratch<T, A> {
+        let scratch = ManuallyDrop::new(self);
+        AlignedScratch {
+            ptr: scratch.ptr.cast::<T>(),
+            len: scratch.len,
+            _align: PhantomData,
+        }
+    }
+}
+
 impl<T: Zeroable, A: Alignment> Default for AlignedScratch<T, A> {
     fn default() -> Self {
         Self::zeroed(0)
@@ -277,8 +342,8 @@ impl<T, A: Alignment> Drop for AlignedScratch<T, A> {
             return;
         }
 
-        // SAFETY: `ptr` was allocated with `alloc_zeroed` using this exact
-        // layout and has not been deallocated yet.
+        // SAFETY: `ptr` was allocated with `alloc`/`alloc_zeroed` using this
+        // exact layout and has not been deallocated yet.
         unsafe { dealloc(self.ptr.as_ptr().cast::<u8>(), layout) };
     }
 }
@@ -337,5 +402,19 @@ mod tests {
     fn aligned_scratch_reports_layout_overflow() {
         let err = AlignedScratch::<u64, Align64>::try_zeroed(usize::MAX).unwrap_err();
         assert_eq!(err, AlignedAllocError::LayoutOverflow);
+    }
+
+    #[test]
+    fn aligned_uninit_scratch_can_be_initialized_in_place() {
+        let mut scratch = AlignedScratch::<MaybeUninit<u16>, Align32>::uninit(8);
+
+        assert_eq!(scratch.as_ptr() as usize % 32, 0);
+        for (idx, slot) in scratch.iter_mut().enumerate() {
+            slot.write((idx as u16) * 3);
+        }
+
+        // SAFETY: every slot was written in the loop above.
+        let scratch = unsafe { scratch.assume_init() };
+        assert_eq!(scratch.as_slice(), &[0, 3, 6, 9, 12, 15, 18, 21]);
     }
 }
