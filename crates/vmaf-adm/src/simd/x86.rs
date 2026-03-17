@@ -1,10 +1,9 @@
 use crate::dwt::{
-    dwt_s123_horizontal_scalar_at, dwt_scale0_horizontal_scalar_at, Bands16, Bands32, DWT_LO_SUM,
-    FILTER_HI, FILTER_LO, SCALE_PARAMS,
+    dwt_s123_horizontal_scalar_at, dwt_scale0_horizontal_scalar_at, Bands16Buffer, Bands32Buffer,
+    Scale0DwtWorkspace, Scale123DwtWorkspace, DWT_LO_SUM, FILTER_HI, FILTER_LO, SCALE_PARAMS,
 };
 use crate::math::reflect_index;
 use std::mem::MaybeUninit;
-use vmaf_cpu::{Align32, AlignedScratch};
 
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
@@ -52,16 +51,21 @@ fn push_i64_as_i32<const N: usize>(dst: &mut Vec<i32>, values: [i64; N]) {
     dst.extend(values.into_iter().map(|value| value as i32));
 }
 
-pub(crate) fn dwt_scale0_sse2(src: &[u16], width: usize, height: usize, bpc: u8) -> Bands16 {
+pub(crate) fn dwt_scale0_sse2_into(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    bpc: u8,
+    workspace: &mut Scale0DwtWorkspace,
+    bands: &mut Bands16Buffer,
+) {
     let (shift_vp, round_vp) = scale0_params(bpc);
     let h_half = height.div_ceil(2);
-    let w_half = width.div_ceil(2);
-    let mut tmplo = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
-    let mut tmphi = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
+    let tmp_len = h_half * width;
+    workspace.prepare_len(tmp_len);
 
     {
-        let tmplo = tmplo.as_mut_slice();
-        let tmphi = tmphi.as_mut_slice();
+        let (tmplo, tmphi) = workspace.uninit_slices(tmp_len);
         for i in 0..h_half {
             let row_start = i * width;
             let row_end = row_start + width;
@@ -81,16 +85,8 @@ pub(crate) fn dwt_scale0_sse2(src: &[u16], width: usize, height: usize, bpc: u8)
         }
     }
 
-    // SAFETY: every temporary slot is written by the vertical pass above.
-    let tmplo = unsafe { tmplo.assume_init() };
-    // SAFETY: every temporary slot is written by the vertical pass above.
-    let tmphi = unsafe { tmphi.assume_init() };
-    let mut band_a = Vec::with_capacity(h_half * w_half);
-    let mut band_v = Vec::with_capacity(h_half * w_half);
-    let mut band_h = Vec::with_capacity(h_half * w_half);
-    let mut band_d = Vec::with_capacity(h_half * w_half);
-    let tmplo = tmplo.as_slice();
-    let tmphi = tmphi.as_slice();
+    let (tmplo, tmphi) = workspace.init_slices(tmp_len);
+    bands.prepare(width, height);
 
     for i in 0..h_half {
         let src_row_start = i * width;
@@ -101,34 +97,30 @@ pub(crate) fn dwt_scale0_sse2(src: &[u16], width: usize, height: usize, bpc: u8)
                 &tmplo[src_row_start..src_row_end],
                 &tmphi[src_row_start..src_row_end],
                 width,
-                &mut band_a,
-                &mut band_v,
-                &mut band_h,
-                &mut band_d,
+                &mut bands.a,
+                &mut bands.v,
+                &mut bands.h,
+                &mut bands.d,
             );
         }
     }
-
-    Bands16 {
-        a: band_a,
-        v: band_v,
-        h: band_h,
-        d: band_d,
-        width: w_half,
-        height: h_half,
-    }
 }
 
-pub(crate) fn dwt_scale0_avx2(src: &[u16], width: usize, height: usize, bpc: u8) -> Bands16 {
+pub(crate) fn dwt_scale0_avx2_into(
+    src: &[u16],
+    width: usize,
+    height: usize,
+    bpc: u8,
+    workspace: &mut Scale0DwtWorkspace,
+    bands: &mut Bands16Buffer,
+) {
     let (shift_vp, round_vp) = scale0_params(bpc);
     let h_half = height.div_ceil(2);
-    let w_half = width.div_ceil(2);
-    let mut tmplo = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
-    let mut tmphi = AlignedScratch::<MaybeUninit<i16>, Align32>::uninit(h_half * width);
+    let tmp_len = h_half * width;
+    workspace.prepare_len(tmp_len);
 
     {
-        let tmplo = tmplo.as_mut_slice();
-        let tmphi = tmphi.as_mut_slice();
+        let (tmplo, tmphi) = workspace.uninit_slices(tmp_len);
         for i in 0..h_half {
             let row_start = i * width;
             let row_end = row_start + width;
@@ -148,16 +140,8 @@ pub(crate) fn dwt_scale0_avx2(src: &[u16], width: usize, height: usize, bpc: u8)
         }
     }
 
-    // SAFETY: every temporary slot is written by the vertical pass above.
-    let tmplo = unsafe { tmplo.assume_init() };
-    // SAFETY: every temporary slot is written by the vertical pass above.
-    let tmphi = unsafe { tmphi.assume_init() };
-    let mut band_a = Vec::with_capacity(h_half * w_half);
-    let mut band_v = Vec::with_capacity(h_half * w_half);
-    let mut band_h = Vec::with_capacity(h_half * w_half);
-    let mut band_d = Vec::with_capacity(h_half * w_half);
-    let tmplo = tmplo.as_slice();
-    let tmphi = tmphi.as_slice();
+    let (tmplo, tmphi) = workspace.init_slices(tmp_len);
+    bands.prepare(width, height);
 
     for i in 0..h_half {
         let src_row_start = i * width;
@@ -168,34 +152,30 @@ pub(crate) fn dwt_scale0_avx2(src: &[u16], width: usize, height: usize, bpc: u8)
                 &tmplo[src_row_start..src_row_end],
                 &tmphi[src_row_start..src_row_end],
                 width,
-                &mut band_a,
-                &mut band_v,
-                &mut band_h,
-                &mut band_d,
+                &mut bands.a,
+                &mut bands.v,
+                &mut bands.h,
+                &mut bands.d,
             );
         }
     }
-
-    Bands16 {
-        a: band_a,
-        v: band_v,
-        h: band_h,
-        d: band_d,
-        width: w_half,
-        height: h_half,
-    }
 }
 
-pub(crate) fn dwt_s123_avx2(ll: &[i32], width: usize, height: usize, scale: usize) -> Bands32 {
+pub(crate) fn dwt_s123_avx2_into(
+    ll: &[i32],
+    width: usize,
+    height: usize,
+    scale: usize,
+    workspace: &mut Scale123DwtWorkspace,
+    bands: &mut Bands32Buffer,
+) {
     let (round_vp, shift_vp, round_hp, shift_hp) = SCALE_PARAMS[scale];
     let h_half = height.div_ceil(2);
-    let w_half = width.div_ceil(2);
-    let mut tmplo = AlignedScratch::<MaybeUninit<i32>, Align32>::uninit(h_half * width);
-    let mut tmphi = AlignedScratch::<MaybeUninit<i32>, Align32>::uninit(h_half * width);
+    let tmp_len = h_half * width;
+    workspace.prepare_len(tmp_len);
 
     {
-        let tmplo = tmplo.as_mut_slice();
-        let tmphi = tmphi.as_mut_slice();
+        let (tmplo, tmphi) = workspace.uninit_slices(tmp_len);
         for i in 0..h_half {
             let row_start = i * width;
             let row_end = row_start + width;
@@ -215,16 +195,8 @@ pub(crate) fn dwt_s123_avx2(ll: &[i32], width: usize, height: usize, scale: usiz
         }
     }
 
-    // SAFETY: every temporary slot is written by the vertical pass above.
-    let tmplo = unsafe { tmplo.assume_init() };
-    // SAFETY: every temporary slot is written by the vertical pass above.
-    let tmphi = unsafe { tmphi.assume_init() };
-    let mut band_a = Vec::with_capacity(h_half * w_half);
-    let mut band_v = Vec::with_capacity(h_half * w_half);
-    let mut band_h = Vec::with_capacity(h_half * w_half);
-    let mut band_d = Vec::with_capacity(h_half * w_half);
-    let tmplo = tmplo.as_slice();
-    let tmphi = tmphi.as_slice();
+    let (tmplo, tmphi) = workspace.init_slices(tmp_len);
+    bands.prepare(width, height);
 
     for i in 0..h_half {
         let src_row_start = i * width;
@@ -237,21 +209,12 @@ pub(crate) fn dwt_s123_avx2(ll: &[i32], width: usize, height: usize, scale: usiz
                 width,
                 round_hp,
                 shift_hp,
-                &mut band_a,
-                &mut band_v,
-                &mut band_h,
-                &mut band_d,
+                &mut bands.a,
+                &mut bands.v,
+                &mut bands.h,
+                &mut bands.d,
             );
         }
-    }
-
-    Bands32 {
-        a: band_a,
-        v: band_v,
-        h: band_h,
-        d: band_d,
-        width: w_half,
-        height: h_half,
     }
 }
 
