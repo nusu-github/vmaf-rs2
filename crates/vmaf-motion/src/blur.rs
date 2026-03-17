@@ -63,14 +63,8 @@ fn select_impl(backend: SimdBackend) -> BlurImpl {
 }
 
 fn blur_frame_scalar(src: &[u16], stride: usize, width: usize, height: usize, bpc: u8) -> Vec<u16> {
-    let n = width * height;
-    let mut tmp = vec![0u16; n];
-    let mut out = vec![0u16; n];
-
-    vertical_pass_scalar(src, stride, width, height, bpc, &mut tmp);
-    horizontal_pass_scalar(&tmp, width, height, &mut out);
-
-    out
+    let tmp = vertical_pass_scalar(src, stride, width, height, bpc);
+    horizontal_pass_scalar(&tmp, width, height)
 }
 
 #[cfg(test)]
@@ -90,25 +84,40 @@ fn vertical_pass_scalar(
     width: usize,
     height: usize,
     bpc: u8,
-    tmp: &mut [u16],
+) -> Vec<u16> {
+    let mut tmp = Vec::with_capacity(width * height);
+    vertical_pass_scalar_uninit(src, stride, width, height, bpc, &mut tmp);
+    tmp
+}
+
+fn vertical_pass_scalar_uninit(
+    src: &[u16],
+    stride: usize,
+    width: usize,
+    height: usize,
+    bpc: u8,
+    tmp: &mut Vec<u16>,
 ) {
     let round_v = 1u32 << (bpc - 1);
     let shift_v = bpc;
 
+    tmp.clear();
     for row in 0..height {
-        let out_row = &mut tmp[row * width..(row + 1) * width];
-        for (col, out) in out_row.iter_mut().enumerate() {
-            *out = vertical_pixel(src, stride, row, col, height, round_v, shift_v);
+        for col in 0..width {
+            tmp.push(vertical_pixel(
+                src, stride, row, col, height, round_v, shift_v,
+            ));
         }
     }
 }
 
-fn horizontal_pass_scalar(tmp: &[u16], width: usize, height: usize, out: &mut [u16]) {
+fn horizontal_pass_scalar(tmp: &[u16], width: usize, height: usize) -> Vec<u16> {
+    let mut out = Vec::with_capacity(width * height);
     for row in 0..height {
         let src_row = &tmp[row * width..(row + 1) * width];
-        let dst_row = &mut out[row * width..(row + 1) * width];
-        horizontal_row_scalar_range(src_row, width, dst_row, 0, width);
+        horizontal_row_scalar_append(src_row, width, &mut out, 0, width);
     }
+    out
 }
 
 #[inline]
@@ -140,15 +149,15 @@ fn horizontal_pixel(row: &[u16], width: usize, col: usize) -> u16 {
 }
 
 #[inline]
-fn horizontal_row_scalar_range(
+fn horizontal_row_scalar_append(
     row: &[u16],
     width: usize,
-    out_row: &mut [u16],
+    out: &mut Vec<u16>,
     start: usize,
     end: usize,
 ) {
     for col in start..end {
-        out_row[col] = horizontal_pixel(row, width, col);
+        out.push(horizontal_pixel(row, width, col));
     }
 }
 
@@ -168,9 +177,10 @@ mod x86 {
     use std::arch::x86::*;
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
+    use std::mem::MaybeUninit;
 
     use super::{
-        horizontal_pass_scalar, horizontal_row_scalar_range, reflect, vertical_pass_scalar,
+        horizontal_pass_scalar, horizontal_row_scalar_append, reflect, vertical_pass_scalar_uninit,
         vertical_pixel, BlurImpl, MOTION_FILTER,
     };
     use vmaf_cpu::{Align32, AlignedScratch, SimdBackend};
@@ -195,14 +205,13 @@ mod x86 {
         bpc: u8,
     ) -> Vec<u16> {
         let n = width * height;
-        let mut tmp = AlignedScratch::<u16, Align32>::zeroed(n);
-        let mut out = vec![0u16; n];
+        let mut tmp = AlignedScratch::<MaybeUninit<u16>, Align32>::uninit(n);
 
         // SAFETY: this wrapper is installed only after runtime SSE2 detection.
         unsafe { vertical_pass_sse2(src, stride, width, height, bpc, tmp.as_mut_slice()) };
-        horizontal_pass_scalar(tmp.as_slice(), width, height, &mut out);
-
-        out
+        // SAFETY: `vertical_pass_sse2` fills every lane before returning.
+        let tmp = unsafe { tmp.assume_init() };
+        horizontal_pass_scalar(tmp.as_slice(), width, height)
     }
 
     fn blur_frame_avx2(
@@ -213,15 +222,14 @@ mod x86 {
         bpc: u8,
     ) -> Vec<u16> {
         let n = width * height;
-        let mut tmp = AlignedScratch::<u16, Align32>::zeroed(n);
-        let mut out = vec![0u16; n];
+        let mut tmp = AlignedScratch::<MaybeUninit<u16>, Align32>::uninit(n);
 
         // SAFETY: this wrapper is installed only after runtime AVX2 detection.
         unsafe { vertical_pass_avx2(src, stride, width, height, bpc, tmp.as_mut_slice()) };
+        // SAFETY: `vertical_pass_avx2` fills every lane before returning.
+        let tmp = unsafe { tmp.assume_init() };
         // SAFETY: this wrapper is installed only after runtime AVX2 detection.
-        unsafe { horizontal_pass_avx2(tmp.as_slice(), width, height, &mut out) };
-
-        out
+        unsafe { horizontal_pass_avx2(tmp.as_slice(), width, height) }
     }
 
     /// SAFETY: caller must ensure SSE2 is available for the current process.
@@ -232,10 +240,14 @@ mod x86 {
         width: usize,
         height: usize,
         bpc: u8,
-        tmp: &mut [u16],
+        tmp: &mut [MaybeUninit<u16>],
     ) {
         if width < 8 {
-            vertical_pass_scalar(src, stride, width, height, bpc, tmp);
+            let mut tmp_vec = Vec::with_capacity(width * height);
+            vertical_pass_scalar_uninit(src, stride, width, height, bpc, &mut tmp_vec);
+            for (dst, value) in tmp.iter_mut().zip(tmp_vec.into_iter()) {
+                dst.write(value);
+            }
             return;
         }
 
@@ -290,7 +302,8 @@ mod x86 {
             }
 
             while col < width {
-                *out_row.add(col) = vertical_pixel(src, stride, row, col, height, round_v, bpc);
+                (*out_row.add(col))
+                    .write(vertical_pixel(src, stride, row, col, height, round_v, bpc));
                 col += 1;
             }
         }
@@ -304,10 +317,14 @@ mod x86 {
         width: usize,
         height: usize,
         bpc: u8,
-        tmp: &mut [u16],
+        tmp: &mut [MaybeUninit<u16>],
     ) {
         if width < 16 {
-            vertical_pass_scalar(src, stride, width, height, bpc, tmp);
+            let mut tmp_vec = Vec::with_capacity(width * height);
+            vertical_pass_scalar_uninit(src, stride, width, height, bpc, &mut tmp_vec);
+            for (dst, value) in tmp.iter_mut().zip(tmp_vec.into_iter()) {
+                dst.write(value);
+            }
             return;
         }
 
@@ -359,7 +376,8 @@ mod x86 {
             }
 
             while col < width {
-                *out_row.add(col) = vertical_pixel(src, stride, row, col, height, round_v, bpc);
+                (*out_row.add(col))
+                    .write(vertical_pixel(src, stride, row, col, height, round_v, bpc));
                 col += 1;
             }
         }
@@ -367,7 +385,7 @@ mod x86 {
 
     /// SAFETY: caller must ensure AVX2 is available for the current process.
     #[target_feature(enable = "avx2")]
-    unsafe fn horizontal_pass_avx2(tmp: &[u16], width: usize, height: usize, out: &mut [u16]) {
+    unsafe fn horizontal_pass_avx2(tmp: &[u16], width: usize, height: usize) -> Vec<u16> {
         let round = _mm256_set1_epi32(32768);
         let shift = _mm_cvtsi32_si128(16);
         let coeff0 = _mm256_set1_epi32(MOTION_FILTER[0] as i32);
@@ -375,12 +393,12 @@ mod x86 {
         let coeff2 = _mm256_set1_epi32(MOTION_FILTER[2] as i32);
         let coeff3 = _mm256_set1_epi32(MOTION_FILTER[3] as i32);
         let coeff4 = _mm256_set1_epi32(MOTION_FILTER[4] as i32);
+        let mut out = Vec::with_capacity(width * height);
 
         for row in 0..height {
             let src_row = &tmp[row * width..(row + 1) * width];
-            let dst_row = &mut out[row * width..(row + 1) * width];
             let prefix_end = width.min(2);
-            horizontal_row_scalar_range(src_row, width, dst_row, 0, prefix_end);
+            horizontal_row_scalar_append(src_row, width, &mut out, 0, prefix_end);
 
             let mut col = prefix_end;
             if width >= 18 {
@@ -409,13 +427,17 @@ mod x86 {
                     let values_lo = _mm256_srl_epi32(_mm256_add_epi32(acc_lo, round), shift);
                     let values_hi = _mm256_srl_epi32(_mm256_add_epi32(acc_hi, round), shift);
                     let packed = pack_u32_pair_to_u16_avx2(values_lo, values_hi);
-                    _mm256_storeu_si256(dst_row.as_mut_ptr().add(col).cast(), packed);
+                    let mut packed_buf = [0u16; 16];
+                    _mm256_storeu_si256(packed_buf.as_mut_ptr().cast(), packed);
+                    out.extend_from_slice(&packed_buf);
                     col += 16;
                 }
             }
 
-            horizontal_row_scalar_range(src_row, width, dst_row, col, width);
+            horizontal_row_scalar_append(src_row, width, &mut out, col, width);
         }
+
+        out
     }
 
     #[inline]

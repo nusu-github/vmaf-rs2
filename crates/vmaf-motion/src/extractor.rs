@@ -45,13 +45,12 @@ impl MotionExtractor {
     }
 
     fn with_backend(width: usize, height: usize, bpc: u8, backend: SimdBackend) -> Self {
-        let empty = vec![0u16; width * height];
         Self {
             width,
             height,
             bpc,
             backend: simd::effective_backend(backend),
-            slots: [empty.clone(), empty.clone(), empty],
+            slots: [Vec::new(), Vec::new(), Vec::new()],
             frame_count: 0,
             motion1_prev: 0.0,
         }
