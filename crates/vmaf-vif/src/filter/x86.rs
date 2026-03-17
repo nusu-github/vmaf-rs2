@@ -101,6 +101,11 @@ unsafe fn vertical_pass_sse2(
     let simd_end = (width / 8) * 8;
     let round_vec = _mm_set1_epi32(round as i32);
     let shift_vec = _mm_cvtsi32_si128(shift as i32);
+    let mut coeff16_vecs = [_mm_setzero_si128(); FILTER_TAP_CAP];
+
+    for tap in 0..coeffs.len() {
+        coeff16_vecs[tap] = _mm_set1_epi16(coeffs[tap] as i16);
+    }
 
     for i in 0..height {
         let row_offsets = reflected_row_offsets(i, height, width, half, coeffs.len());
@@ -114,8 +119,8 @@ unsafe fn vertical_pass_sse2(
             let mut acc_dis_lo = _mm_setzero_si128();
             let mut acc_dis_hi = _mm_setzero_si128();
 
-            for (tap, &coeff) in coeffs.iter().enumerate() {
-                let coeff16 = _mm_set1_epi16(coeff as i16);
+            for tap in 0..coeffs.len() {
+                let coeff16 = coeff16_vecs[tap];
                 let ref_values = _mm_loadu_si128(ref_in.as_ptr().add(row_offsets[tap] + j).cast());
                 let dis_values = _mm_loadu_si128(dis_in.as_ptr().add(row_offsets[tap] + j).cast());
                 let (ref_lo, ref_hi) = mul_u16x8_u32x8(ref_values, coeff16);
@@ -163,6 +168,11 @@ unsafe fn horizontal_pass_sse2(
 ) {
     let round_vec = _mm_set1_epi32(HORIZONTAL_ROUND as i32);
     let (body_start, simd_end) = horizontal_simd_body_range(width, half, 8);
+    let mut coeff16_vecs = [_mm_setzero_si128(); FILTER_TAP_CAP];
+
+    for tap in 0..coeffs.len() {
+        coeff16_vecs[tap] = _mm_set1_epi16(coeffs[tap] as i16);
+    }
 
     for i in 0..height {
         let row = i * width;
@@ -183,14 +193,15 @@ unsafe fn horizontal_pass_sse2(
         );
 
         for j in (body_start..simd_end).step_by(8) {
+            let base_start = j - half;
             let mut acc_ref_lo = _mm_setzero_si128();
             let mut acc_ref_hi = _mm_setzero_si128();
             let mut acc_dis_lo = _mm_setzero_si128();
             let mut acc_dis_hi = _mm_setzero_si128();
 
-            for (tap, &coeff) in coeffs.iter().enumerate() {
-                let coeff16 = _mm_set1_epi16(coeff as i16);
-                let base = j - half + tap;
+            for tap in 0..coeffs.len() {
+                let coeff16 = coeff16_vecs[tap];
+                let base = base_start + tap;
                 let ref_values = _mm_loadu_si128(tmp_ref_row.as_ptr().add(base).cast());
                 let dis_values = _mm_loadu_si128(tmp_dis_row.as_ptr().add(base).cast());
                 let (ref_lo, ref_hi) = mul_u16x8_u32x8(ref_values, coeff16);
@@ -251,6 +262,11 @@ unsafe fn vertical_pass_avx2(
     let simd_end = (width / 16) * 16;
     let round_vec = _mm256_set1_epi32(round as i32);
     let shift_vec = _mm_cvtsi32_si128(shift as i32);
+    let mut coeff32_vecs = [_mm256_setzero_si256(); FILTER_TAP_CAP];
+
+    for tap in 0..coeffs.len() {
+        coeff32_vecs[tap] = _mm256_set1_epi32(coeffs[tap] as i32);
+    }
 
     for i in 0..height {
         let row_offsets = reflected_row_offsets(i, height, width, half, coeffs.len());
@@ -264,8 +280,8 @@ unsafe fn vertical_pass_avx2(
             let mut acc_dis_lo = _mm256_setzero_si256();
             let mut acc_dis_hi = _mm256_setzero_si256();
 
-            for (tap, &coeff) in coeffs.iter().enumerate() {
-                let coeff32 = _mm256_set1_epi32(coeff as i32);
+            for tap in 0..coeffs.len() {
+                let coeff32 = coeff32_vecs[tap];
                 let ref_values =
                     _mm256_loadu_si256(ref_in.as_ptr().add(row_offsets[tap] + j).cast());
                 let dis_values =
@@ -315,6 +331,11 @@ unsafe fn horizontal_pass_avx2(
 ) {
     let round_vec = _mm256_set1_epi32(HORIZONTAL_ROUND as i32);
     let (body_start, simd_end) = horizontal_simd_body_range(width, half, 16);
+    let mut coeff32_vecs = [_mm256_setzero_si256(); FILTER_TAP_CAP];
+
+    for tap in 0..coeffs.len() {
+        coeff32_vecs[tap] = _mm256_set1_epi32(coeffs[tap] as i32);
+    }
 
     for i in 0..height {
         let row = i * width;
@@ -335,14 +356,15 @@ unsafe fn horizontal_pass_avx2(
         );
 
         for j in (body_start..simd_end).step_by(16) {
+            let base_start = j - half;
             let mut acc_ref_lo = _mm256_setzero_si256();
             let mut acc_ref_hi = _mm256_setzero_si256();
             let mut acc_dis_lo = _mm256_setzero_si256();
             let mut acc_dis_hi = _mm256_setzero_si256();
 
-            for (tap, &coeff) in coeffs.iter().enumerate() {
-                let coeff32 = _mm256_set1_epi32(coeff as i32);
-                let base = j - half + tap;
+            for tap in 0..coeffs.len() {
+                let coeff32 = coeff32_vecs[tap];
+                let base = base_start + tap;
                 let ref_values = _mm256_loadu_si256(tmp_ref_row.as_ptr().add(base).cast());
                 let dis_values = _mm256_loadu_si256(tmp_dis_row.as_ptr().add(base).cast());
                 let (ref_lo, ref_hi) = mul_u16x16_u32x16(ref_values, coeff32);
@@ -416,13 +438,14 @@ unsafe fn store_u32x8_as_u16(out: &mut [u16], start: usize, low: __m128i, high: 
     }
 }
 
-#[inline(always)]
+#[target_feature(enable = "avx2,sse4.1")]
 unsafe fn store_u32x16_as_u16(out: &mut [u16], start: usize, low: __m256i, high: __m256i) {
-    let mut tmp = [0u32; 16];
-    _mm256_storeu_si256(tmp.as_mut_ptr().cast(), low);
-    _mm256_storeu_si256(tmp.as_mut_ptr().add(8).cast(), high);
-
-    for (dst, value) in out[start..start + 16].iter_mut().zip(tmp) {
-        *dst = value as u16;
-    }
+    let low_lo = _mm256_castsi256_si128(low);
+    let low_hi = _mm256_extracti128_si256(low, 1);
+    let high_lo = _mm256_castsi256_si128(high);
+    let high_hi = _mm256_extracti128_si256(high, 1);
+    let packed_lo = _mm_packus_epi32(low_lo, low_hi);
+    let packed_hi = _mm_packus_epi32(high_lo, high_hi);
+    _mm_storeu_si128(out.as_mut_ptr().add(start).cast(), packed_lo);
+    _mm_storeu_si128(out.as_mut_ptr().add(start + 8).cast(), packed_hi);
 }
