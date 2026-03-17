@@ -1,8 +1,38 @@
 //! ADM feature extractor — spec §4.3
 
+use crate::dwt::{Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace};
 use crate::score::{score_scale0, score_scale_s123};
 use crate::simd;
 use vmaf_cpu::SimdBackend;
+
+/// Reusable internal buffers for per-frame ADM extraction.
+#[doc(hidden)]
+pub struct AdmWorkspace {
+    cur_ref_ll: Vec<i32>,
+    cur_dis_ll: Vec<i32>,
+    scale0: Scale0DwtWorkspace,
+    scale123: Scale123DwtWorkspace,
+    ref_scale0: Bands16Buffer,
+    dis_scale0: Bands16Buffer,
+    ref_scale: Bands32Buffer,
+    dis_scale: Bands32Buffer,
+}
+
+impl AdmWorkspace {
+    fn new(width: usize, height: usize) -> Self {
+        let scale0_area = width.div_ceil(2) * height.div_ceil(2);
+        Self {
+            cur_ref_ll: Vec::with_capacity(scale0_area),
+            cur_dis_ll: Vec::with_capacity(scale0_area),
+            scale0: Scale0DwtWorkspace::new(width, height),
+            scale123: Scale123DwtWorkspace::new(width.div_ceil(2), height.div_ceil(2)),
+            ref_scale0: Bands16Buffer::with_capacity(scale0_area),
+            dis_scale0: Bands16Buffer::with_capacity(scale0_area),
+            ref_scale: Bands32Buffer::with_capacity(scale0_area),
+            dis_scale: Bands32Buffer::with_capacity(scale0_area),
+        }
+    }
+}
 
 /// Stateless ADM extractor: computes the `adm2` score for one reference/distorted frame pair.
 pub struct AdmExtractor {
@@ -51,50 +81,108 @@ impl AdmExtractor {
         }
     }
 
-    /// Compute the `adm2` score for one frame pair — spec §4.3.
-    ///
-    /// `ref_plane` and `dis_plane` are row-major luma planes with `width × height` samples.
-    pub fn compute_frame(&self, ref_plane: &[u16], dis_plane: &[u16]) -> f64 {
+    #[doc(hidden)]
+    pub fn make_workspace(&self) -> AdmWorkspace {
+        AdmWorkspace::new(self.width, self.height)
+    }
+
+    #[doc(hidden)]
+    pub fn compute_frame_with_workspace(
+        &self,
+        workspace: &mut AdmWorkspace,
+        ref_plane: &[u16],
+        dis_plane: &[u16],
+    ) -> f64 {
         let (w, h, bpc) = (self.width, self.height, self.bpc);
         let limit = self.adm_enhn_gain_limit;
         let backend = self.backend;
 
-        // Scale 0 DWT
-        let ref0 = simd::dwt_scale0(backend, ref_plane, w, h, bpc);
-        let dis0 = simd::dwt_scale0(backend, dis_plane, w, h, bpc);
-        let (w0, h0) = (ref0.width, ref0.height);
-        // Score scale 0 (integrated decouple + integer_adm fixed-point path)
+        simd::dwt_scale0_into(
+            backend,
+            ref_plane,
+            w,
+            h,
+            bpc,
+            &mut workspace.scale0,
+            &mut workspace.ref_scale0,
+        );
+        simd::dwt_scale0_into(
+            backend,
+            dis_plane,
+            w,
+            h,
+            bpc,
+            &mut workspace.scale0,
+            &mut workspace.dis_scale0,
+        );
+        let (w0, h0) = (workspace.ref_scale0.width, workspace.ref_scale0.height);
         let (num0, den0) = score_scale0(
-            &ref0.h, &ref0.v, &ref0.d, &dis0.h, &dis0.v, &dis0.d, limit, w0, h0,
+            &workspace.ref_scale0.h,
+            &workspace.ref_scale0.v,
+            &workspace.ref_scale0.d,
+            &workspace.dis_scale0.h,
+            &workspace.dis_scale0.v,
+            &workspace.dis_scale0.d,
+            limit,
+            w0,
+            h0,
         );
 
-        // Widen scale-0 LL to i32 (plain sign-extension, no shift)
-        let mut cur_ref_ll: Vec<i32> = ref0.a.iter().map(|&x| x as i32).collect();
-        let mut cur_dis_ll: Vec<i32> = dis0.a.iter().map(|&x| x as i32).collect();
+        workspace.cur_ref_ll.clear();
+        workspace
+            .cur_ref_ll
+            .extend(workspace.ref_scale0.a.iter().map(|&x| x as i32));
+        workspace.cur_dis_ll.clear();
+        workspace
+            .cur_dis_ll
+            .extend(workspace.dis_scale0.a.iter().map(|&x| x as i32));
         let mut cur_w = w0;
         let mut cur_h = h0;
 
         let mut num_total = num0;
         let mut den_total = den0;
 
-        // Scales 1–3
         for scale in 1..=3usize {
-            let ref_s = simd::dwt_s123(backend, &cur_ref_ll, cur_w, cur_h, scale);
-            let dis_s = simd::dwt_s123(backend, &cur_dis_ll, cur_w, cur_h, scale);
-            let (ws, hs) = (ref_s.width, ref_s.height);
+            simd::dwt_s123_into(
+                backend,
+                &workspace.cur_ref_ll,
+                cur_w,
+                cur_h,
+                scale,
+                &mut workspace.scale123,
+                &mut workspace.ref_scale,
+            );
+            simd::dwt_s123_into(
+                backend,
+                &workspace.cur_dis_ll,
+                cur_w,
+                cur_h,
+                scale,
+                &mut workspace.scale123,
+                &mut workspace.dis_scale,
+            );
+            let (ws, hs) = (workspace.ref_scale.width, workspace.ref_scale.height);
             let (num_s, den_s) = score_scale_s123(
-                &ref_s.h, &ref_s.v, &ref_s.d, &dis_s.h, &dis_s.v, &dis_s.d, limit, scale, ws, hs,
+                &workspace.ref_scale.h,
+                &workspace.ref_scale.v,
+                &workspace.ref_scale.d,
+                &workspace.dis_scale.h,
+                &workspace.dis_scale.v,
+                &workspace.dis_scale.d,
+                limit,
+                scale,
+                ws,
+                hs,
             );
             num_total += num_s;
             den_total += den_s;
 
-            cur_ref_ll = ref_s.a;
-            cur_dis_ll = dis_s.a;
+            std::mem::swap(&mut workspace.cur_ref_ll, &mut workspace.ref_scale.a);
+            std::mem::swap(&mut workspace.cur_dis_ll, &mut workspace.dis_scale.a);
             cur_w = ws;
             cur_h = hs;
         }
 
-        // Final adm2 score — spec §4.3.9
         let numden_limit = 1e-10 * (w * h) as f64 / (1920.0 * 1080.0);
         let num_d = if (num_total as f64) < numden_limit {
             0.0
@@ -111,5 +199,46 @@ impl AdmExtractor {
         } else {
             num_d / den_d
         }
+    }
+
+    /// Compute the `adm2` score for one frame pair — spec §4.3.
+    ///
+    /// `ref_plane` and `dis_plane` are row-major luma planes with `width × height` samples.
+    pub fn compute_frame(&self, ref_plane: &[u16], dis_plane: &[u16]) -> f64 {
+        let mut workspace = self.make_workspace();
+        self.compute_frame_with_workspace(&mut workspace, ref_plane, dis_plane)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vmaf_cpu::SimdBackend;
+
+    fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
+        (0..height)
+            .flat_map(|y| {
+                (0..width).map(move |x| {
+                    ((x * 17 + y * 19 + (x ^ y) * 5 + x * y * 3 + bias) % modulus as usize) as u16
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn workspace_path_matches_plain_compute() {
+        let extractor = AdmExtractor::with_backend_for_tests(64, 64, 8, 100.0, SimdBackend::Scalar);
+        let reference = patterned_plane(64, 64, 255, 7);
+        let distorted = patterned_plane(64, 64, 255, 23);
+        let mut workspace = extractor.make_workspace();
+
+        let plain = extractor.compute_frame(&reference, &distorted);
+        let reused1 =
+            extractor.compute_frame_with_workspace(&mut workspace, &reference, &distorted);
+        let reused2 =
+            extractor.compute_frame_with_workspace(&mut workspace, &reference, &distorted);
+
+        assert_eq!(plain.to_bits(), reused1.to_bits());
+        assert_eq!(plain.to_bits(), reused2.to_bits());
     }
 }

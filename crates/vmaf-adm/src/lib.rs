@@ -13,7 +13,7 @@ mod score;
 mod simd;
 mod tables;
 
-pub use extractor::AdmExtractor;
+pub use extractor::{AdmExtractor, AdmWorkspace};
 
 #[cfg(test)]
 mod tests {
