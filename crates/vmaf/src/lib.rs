@@ -1,6 +1,12 @@
 //! vmaf — public API and pipeline orchestration — spec §2
 #![deny(unsafe_code)]
 
+use std::{
+    collections::VecDeque,
+    ops::AddAssign,
+    time::{Duration, Instant},
+};
+
 use thiserror::Error;
 use vmaf_adm::{AdmError, AdmExtractor, AdmWorkspace};
 pub use vmaf_model::{
@@ -13,6 +19,7 @@ use vmaf_motion::{MotionError, MotionExtractor};
 use vmaf_vif::{VifError, VifExtractor, VifWorkspace};
 
 const MIN_FRAME_DIMENSION: usize = 16;
+const MIN_PARALLEL_JOB_LEN: usize = 2;
 
 /// Errors produced by [`VmafContext`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -91,7 +98,7 @@ impl From<MotionError> for VmafError {
 }
 
 /// Per-frame VMAF scores and features.
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct FrameScore {
     pub frame_index: usize,
     pub score: f64,
@@ -101,6 +108,27 @@ pub struct FrameScore {
     pub vif_scale1: f64,
     pub vif_scale2: f64,
     pub vif_scale3: f64,
+}
+
+/// Profiling timings for one or more frame-processing calls.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessingTimings {
+    pub validation: Duration,
+    pub feature_extraction: Duration,
+    pub motion: Duration,
+    pub finalize: Duration,
+    pub total: Duration,
+}
+
+impl AddAssign for ProcessingTimings {
+    fn add_assign(&mut self, rhs: Self) {
+        self.validation += rhs.validation;
+        self.feature_extraction += rhs.feature_extraction;
+        self.motion += rhs.motion;
+        self.finalize += rhs.finalize;
+        self.total += rhs.total;
+    }
 }
 
 struct PendingFrame {
@@ -130,7 +158,7 @@ pub struct VmafContext {
     motion: MotionExtractor,
     width: usize,
     height: usize,
-    pending: Vec<PendingFrame>,
+    pending: VecDeque<PendingFrame>,
     per_frame_scores: Vec<FrameScore>,
     frame_count: usize,
     opts: VmafOptions,
@@ -176,7 +204,7 @@ impl VmafContext {
             model,
             width,
             height,
-            pending: Vec::new(),
+            pending: VecDeque::with_capacity(2),
             per_frame_scores: Vec::new(),
             frame_count: 0,
             opts,
@@ -196,25 +224,7 @@ impl VmafContext {
         reference: &[u16],
         distorted: &[u16],
     ) -> Result<Option<FrameScore>, VmafError> {
-        self.ensure_active()?;
-        self.validate_frame_inputs(reference, distorted)?;
-
-        let vif_scores =
-            self.vif
-                .compute_frame_with_workspace(&mut self.vif_workspace, reference, distorted);
-        let adm_score =
-            self.adm
-                .compute_frame_with_workspace(&mut self.adm_workspace, reference, distorted);
-        let motion_result = self.motion.push_frame(reference, self.width)?;
-
-        self.pending.push(PendingFrame {
-            frame_idx: self.frame_count,
-            adm: adm_score,
-            vif: vif_scores.scale,
-        });
-        self.frame_count += 1;
-
-        Ok(motion_result.and_then(|(idx, m2)| self.finalize_frame(idx, m2 as f64)))
+        self.push_frame_impl(reference, distorted, true, None)
     }
 
     /// Push a batch of reference/distorted frame pairs in parallel.
@@ -228,15 +238,42 @@ impl VmafContext {
         &mut self,
         frames: &[(&[u16], &[u16])],
     ) -> Result<Vec<FrameScore>, VmafError> {
+        self.push_frame_batch_impl(frames, None)
+    }
+
+    /// Push a batch of frames and return profiling timings for the work performed.
+    #[doc(hidden)]
+    pub fn push_frame_batch_with_timings(
+        &mut self,
+        frames: &[(&[u16], &[u16])],
+    ) -> Result<(Vec<FrameScore>, ProcessingTimings), VmafError> {
+        let mut timings = ProcessingTimings::default();
+        let scores = self.push_frame_batch_impl(frames, Some(&mut timings))?;
+        Ok((scores, timings))
+    }
+
+    fn push_frame_batch_impl(
+        &mut self,
+        frames: &[(&[u16], &[u16])],
+        mut timings: Option<&mut ProcessingTimings>,
+    ) -> Result<Vec<FrameScore>, VmafError> {
+        let validation_start = Instant::now();
         self.ensure_active()?;
         for &(reference, distorted) in frames {
             self.validate_frame_inputs(reference, distorted)?;
+        }
+        if let Some(timings) = timings.as_mut() {
+            let elapsed = validation_start.elapsed();
+            timings.validation += elapsed;
+            timings.total += elapsed;
         }
 
         if frames.len() <= 1 || rayon::current_num_threads() <= 1 {
             let mut out = Vec::with_capacity(frames.len());
             for &(reference, distorted) in frames {
-                if let Some(score) = self.push_frame(reference, distorted)? {
+                if let Some(score) =
+                    self.push_frame_impl(reference, distorted, false, timings.as_deref_mut())?
+                {
                     out.push(score);
                 }
             }
@@ -249,8 +286,15 @@ impl VmafContext {
         let adm = &self.adm;
         let motion = &self.motion;
         let stride = self.width;
+        let processing_start = Instant::now();
+        let feature_start = Instant::now();
+        let min_job_len = frames
+            .len()
+            .div_ceil(rayon::current_num_threads())
+            .max(MIN_PARALLEL_JOB_LEN);
         let extracted: Vec<_> = frames
             .par_iter()
+            .with_min_len(min_job_len)
             .map_init(
                 || (vif.make_workspace(), adm.make_workspace()),
                 |(vif_workspace, adm_workspace), (r, d)| {
@@ -261,21 +305,41 @@ impl VmafContext {
                 },
             )
             .collect();
+        if let Some(timings) = timings.as_mut() {
+            timings.feature_extraction += feature_start.elapsed();
+        }
 
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(frames.len());
         for (vif_scores, adm_score, blur) in extracted {
-            self.pending.push(PendingFrame {
+            let enqueue_start = Instant::now();
+            self.pending.push_back(PendingFrame {
                 frame_idx: self.frame_count,
                 adm: adm_score,
                 vif: vif_scores.scale,
             });
             self.frame_count += 1;
+            if let Some(timings) = timings.as_mut() {
+                timings.finalize += enqueue_start.elapsed();
+            }
 
-            if let Some((idx, m2)) = self.motion.push_blurred_frame(blur)? {
+            let motion_start = Instant::now();
+            let motion_result = self.motion.push_blurred_frame(blur)?;
+            if let Some(timings) = timings.as_mut() {
+                timings.motion += motion_start.elapsed();
+            }
+
+            if let Some((idx, m2)) = motion_result {
+                let finalize_start = Instant::now();
                 if let Some(fs) = self.finalize_frame(idx, m2 as f64) {
                     out.push(fs);
                 }
+                if let Some(timings) = timings.as_mut() {
+                    timings.finalize += finalize_start.elapsed();
+                }
             }
+        }
+        if let Some(timings) = timings.as_mut() {
+            timings.total += processing_start.elapsed();
         }
         Ok(out)
     }
@@ -313,8 +377,7 @@ impl VmafContext {
     }
 
     fn finalize_frame(&mut self, idx: usize, m2: f64) -> Option<FrameScore> {
-        let pos = self.pending.iter().position(|p| p.frame_idx == idx)?;
-        let pf = self.pending.remove(pos);
+        let pf = self.take_pending_frame(idx)?;
 
         // Feature order: [adm2, motion2, vif_scale0, vif_scale1, vif_scale2, vif_scale3] — spec §6
         let raw: [f64; 6] = [pf.adm, m2, pf.vif[0], pf.vif[1], pf.vif[2], pf.vif[3]];
@@ -342,8 +405,69 @@ impl VmafContext {
             vif_scale2: pf.vif[2],
             vif_scale3: pf.vif[3],
         };
-        self.per_frame_scores.push(fs.clone());
+        self.per_frame_scores.push(fs);
         Some(fs)
+    }
+
+    fn push_frame_impl(
+        &mut self,
+        reference: &[u16],
+        distorted: &[u16],
+        validate_inputs: bool,
+        mut timings: Option<&mut ProcessingTimings>,
+    ) -> Result<Option<FrameScore>, VmafError> {
+        let total_start = Instant::now();
+
+        if validate_inputs {
+            let validation_start = Instant::now();
+            self.ensure_active()?;
+            self.validate_frame_inputs(reference, distorted)?;
+            if let Some(timings) = timings.as_mut() {
+                timings.validation += validation_start.elapsed();
+            }
+        }
+
+        let feature_start = Instant::now();
+        let vif_scores =
+            self.vif
+                .compute_frame_with_workspace(&mut self.vif_workspace, reference, distorted);
+        let adm_score =
+            self.adm
+                .compute_frame_with_workspace(&mut self.adm_workspace, reference, distorted);
+        if let Some(timings) = timings.as_mut() {
+            timings.feature_extraction += feature_start.elapsed();
+        }
+
+        let motion_start = Instant::now();
+        let motion_result = self.motion.push_frame(reference, self.width)?;
+        if let Some(timings) = timings.as_mut() {
+            timings.motion += motion_start.elapsed();
+        }
+
+        let finalize_start = Instant::now();
+        self.pending.push_back(PendingFrame {
+            frame_idx: self.frame_count,
+            adm: adm_score,
+            vif: vif_scores.scale,
+        });
+        self.frame_count += 1;
+
+        let result = motion_result.and_then(|(idx, m2)| self.finalize_frame(idx, m2 as f64));
+        if let Some(timings) = timings.as_mut() {
+            timings.finalize += finalize_start.elapsed();
+            timings.total += total_start.elapsed();
+        }
+        Ok(result)
+    }
+
+    fn take_pending_frame(&mut self, idx: usize) -> Option<PendingFrame> {
+        match self.pending.front() {
+            Some(front) if front.frame_idx == idx => self.pending.pop_front(),
+            _ => {
+                let pos = self.pending.iter().position(|p| p.frame_idx == idx)?;
+                self.pending.remove(pos)
+            }
+        }
     }
 
     fn frame_len(&self) -> usize {
@@ -391,6 +515,12 @@ fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_job_len_has_two_frame_floor() {
+        let len = 8usize.div_ceil(8).max(MIN_PARALLEL_JOB_LEN);
+        assert_eq!(len, 2);
+    }
 
     #[test]
     fn neg_model_feature_opts_change_scores() {

@@ -24,6 +24,23 @@ pub(crate) struct ScaleStat {
     pub den: f64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum VifGainLimitMode {
+    Unit,
+    Generic(f64),
+}
+
+impl VifGainLimitMode {
+    #[inline]
+    pub(crate) fn new(limit: f64) -> Self {
+        if limit == 1.0 {
+            Self::Unit
+        } else {
+            Self::Generic(limit)
+        }
+    }
+}
+
 /// Reusable aligned row buffers for one VIF statistic pass.
 #[derive(Debug)]
 pub(crate) struct VifStatWorkspace {
@@ -83,6 +100,7 @@ struct RunningStatAccumulators {
 /// CRITICAL: for `bpc == 8 && scale == 0`, the squared accumulators in the
 /// vertical pass use **uint32** (wrapping) intentionally — spec §8.
 /// All other paths use uint64.
+#[cfg(test)]
 pub(crate) fn vif_statistic(
     ref_plane: &[u16],
     dis_plane: &[u16],
@@ -94,19 +112,20 @@ pub(crate) fn vif_statistic(
     backend: SimdBackend,
 ) -> ScaleStat {
     let mut workspace = VifStatWorkspace::new(width);
-    vif_statistic_with_workspace(
+    vif_statistic_with_workspace_mode(
         ref_plane,
         dis_plane,
         width,
         height,
         bpc,
         scale,
-        vif_enhn_gain_limit,
+        VifGainLimitMode::new(vif_enhn_gain_limit),
         &mut workspace,
         backend,
     )
 }
 
+#[cfg(test)]
 pub(crate) fn vif_statistic_with_workspace(
     ref_plane: &[u16],
     dis_plane: &[u16],
@@ -118,6 +137,30 @@ pub(crate) fn vif_statistic_with_workspace(
     workspace: &mut VifStatWorkspace,
     backend: SimdBackend,
 ) -> ScaleStat {
+    vif_statistic_with_workspace_mode(
+        ref_plane,
+        dis_plane,
+        width,
+        height,
+        bpc,
+        scale,
+        VifGainLimitMode::new(vif_enhn_gain_limit),
+        workspace,
+        backend,
+    )
+}
+
+pub(crate) fn vif_statistic_with_workspace_mode(
+    ref_plane: &[u16],
+    dis_plane: &[u16],
+    width: usize,
+    height: usize,
+    bpc: u8,
+    scale: usize,
+    vif_gain_limit_mode: VifGainLimitMode,
+    workspace: &mut VifStatWorkspace,
+    backend: SimdBackend,
+) -> ScaleStat {
     match backend {
         SimdBackend::Scalar => vif_statistic_scalar_with_workspace(
             ref_plane,
@@ -126,7 +169,7 @@ pub(crate) fn vif_statistic_with_workspace(
             height,
             bpc,
             scale,
-            vif_enhn_gain_limit,
+            vif_gain_limit_mode,
             workspace,
         ),
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -138,7 +181,7 @@ pub(crate) fn vif_statistic_with_workspace(
                 height,
                 bpc,
                 scale,
-                vif_enhn_gain_limit,
+                vif_gain_limit_mode,
                 workspace,
                 backend,
             )
@@ -150,7 +193,7 @@ pub(crate) fn vif_statistic_with_workspace(
             height,
             bpc,
             scale,
-            vif_enhn_gain_limit,
+            vif_gain_limit_mode,
             workspace,
             backend,
         ),
@@ -162,7 +205,7 @@ pub(crate) fn vif_statistic_with_workspace(
             height,
             bpc,
             scale,
-            vif_enhn_gain_limit,
+            vif_gain_limit_mode,
             workspace,
         ),
     }
@@ -175,7 +218,7 @@ fn vif_statistic_scalar_with_workspace(
     height: usize,
     bpc: u8,
     scale: usize,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     workspace: &mut VifStatWorkspace,
 ) -> ScaleStat {
     let filt = &FILTER[scale][..FILTER_WIDTH[scale]];
@@ -240,7 +283,7 @@ fn vif_statistic_scalar_with_workspace(
             half,
             0,
             width,
-            vif_enhn_gain_limit,
+            vif_gain_limit_mode,
             &mut accum,
         );
     }
@@ -389,7 +432,7 @@ fn horizontal_scalar_range(
     half: usize,
     start: usize,
     end: usize,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     accum: &mut RunningStatAccumulators,
 ) {
     let width = tmp_mu1.len();
@@ -417,7 +460,7 @@ fn horizontal_scalar_range(
             acc_ref,
             acc_dis,
             acc_rdi,
-            vif_enhn_gain_limit,
+            vif_gain_limit_mode,
             accum,
         );
     }
@@ -443,7 +486,7 @@ fn process_filtered_pixel(
     acc_ref: u64,
     acc_dis: u64,
     acc_rdi: u64,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     accum: &mut RunningStatAccumulators,
 ) {
     let mu1_sq = ((acc_mu1 as u64 * acc_mu1 as u64 + 2147483648) >> 32) as u32;
@@ -458,7 +501,7 @@ fn process_filtered_pixel(
     let sigma2_sq = (dis_filt as i64 - mu2_sq as i64).max(0);
     let sigma12 = rdi_filt as i64 - mu1_mu2 as i64;
 
-    process_sigma_values(sigma1_sq, sigma2_sq, sigma12, vif_enhn_gain_limit, accum);
+    process_sigma_values(sigma1_sq, sigma2_sq, sigma12, vif_gain_limit_mode, accum);
 }
 
 #[inline]
@@ -466,31 +509,87 @@ fn process_sigma_values(
     sigma1_sq: i64,
     sigma2_sq: i64,
     sigma12: i64,
+    vif_gain_limit_mode: VifGainLimitMode,
+    accum: &mut RunningStatAccumulators,
+) {
+    match vif_gain_limit_mode {
+        VifGainLimitMode::Unit => {
+            process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, 1.0, accum);
+        }
+        VifGainLimitMode::Generic(limit) => {
+            process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, limit, accum);
+        }
+    }
+}
+
+#[cfg(test)]
+#[inline]
+fn process_sigma_row(
+    sigma1_row: &[i64],
+    sigma2_row: &[i64],
+    sigma12_row: &[i64],
+    vif_gain_limit_mode: VifGainLimitMode,
+    accum: &mut RunningStatAccumulators,
+) {
+    debug_assert_eq!(sigma1_row.len(), sigma2_row.len());
+    debug_assert_eq!(sigma1_row.len(), sigma12_row.len());
+
+    match vif_gain_limit_mode {
+        VifGainLimitMode::Unit => {
+            for ((&sigma1_sq, &sigma2_sq), &sigma12) in sigma1_row
+                .iter()
+                .zip(sigma2_row.iter())
+                .zip(sigma12_row.iter())
+            {
+                process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, 1.0, accum);
+            }
+        }
+        VifGainLimitMode::Generic(limit) => {
+            for ((&sigma1_sq, &sigma2_sq), &sigma12) in sigma1_row
+                .iter()
+                .zip(sigma2_row.iter())
+                .zip(sigma12_row.iter())
+            {
+                process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, limit, accum);
+            }
+        }
+    }
+}
+
+#[inline]
+fn process_sigma_values_with_limit(
+    sigma1_sq: i64,
+    sigma2_sq: i64,
+    sigma12: i64,
     vif_enhn_gain_limit: f64,
     accum: &mut RunningStatAccumulators,
 ) {
-    if sigma1_sq >= SIGMA_NSQ as i64 {
-        let sigma1_u32 = sigma1_sq.min(u32::MAX as i64) as u32;
-        accum.accum_den_log +=
-            log2_32(&LOG2_TABLE, SIGMA_NSQ.saturating_add(sigma1_u32)) as i64 - 2048 * 17;
-
-        if sigma12 > 0 && sigma2_sq > 0 {
-            let g = sigma12 as f64 / (sigma1_sq as f64 + EPSILON);
-            let sv_sq = (sigma2_sq - (g * sigma12 as f64) as i64).max(0);
-            let g = g.min(vif_enhn_gain_limit);
-
-            let sv_u32 = sv_sq.min(u32::MAX as i64) as u32;
-            let numer1 = sv_u32.saturating_add(SIGMA_NSQ);
-            let numer1_tmp = (g * g * sigma1_sq as f64) as i64 + numer1 as i64;
-            let numer1_tmp = numer1_tmp.max(numer1 as i64) as u64;
-
-            accum.accum_num_log += log2_64(&LOG2_TABLE, numer1_tmp) as i64
-                - log2_64(&LOG2_TABLE, numer1 as u64) as i64;
-        }
-    } else {
+    if sigma1_sq < SIGMA_NSQ as i64 {
         accum.accum_num_non_log += sigma2_sq;
         accum.accum_den_non_log += 1;
+        return;
     }
+
+    debug_assert!((0..=u32::MAX as i64).contains(&sigma1_sq));
+    let sigma1_u32 = sigma1_sq as u32;
+    accum.accum_den_log +=
+        log2_32(&LOG2_TABLE, SIGMA_NSQ.saturating_add(sigma1_u32)) as i64 - 2048 * 17;
+
+    if sigma12 <= 0 || sigma2_sq <= 0 {
+        return;
+    }
+
+    let g = sigma12 as f64 / (sigma1_sq as f64 + EPSILON);
+    let sv_sq = (sigma2_sq - (g * sigma12 as f64) as i64).max(0);
+    let g = g.min(vif_enhn_gain_limit);
+
+    debug_assert!((0..=u32::MAX as i64).contains(&sv_sq));
+    let sv_u32 = sv_sq as u32;
+    let numer1 = sv_u32.saturating_add(SIGMA_NSQ);
+    let numer1_tmp = (g * g * sigma1_sq as f64) as u64 + numer1 as u64;
+
+    accum.accum_num_log +=
+        log2_64(&LOG2_TABLE, numer1_tmp) as i64 - log2_32(&LOG2_TABLE, numer1) as i64;
 }
 
 #[inline]
@@ -564,5 +663,49 @@ mod tests {
         );
         assert_eq!(expected.num.to_bits(), repeated.num.to_bits());
         assert_eq!(expected.den.to_bits(), repeated.den.to_bits());
+    }
+
+    #[test]
+    fn gain_limit_mode_classifies_exact_one() {
+        assert!(matches!(VifGainLimitMode::new(1.0), VifGainLimitMode::Unit));
+        assert!(matches!(
+            VifGainLimitMode::new(100.0),
+            VifGainLimitMode::Generic(limit) if limit == 100.0
+        ));
+    }
+
+    #[test]
+    fn unit_gain_mode_matches_generic_one_for_sigma_rows() {
+        let sigma1 = [
+            SIGMA_NSQ as i64 - 7,
+            SIGMA_NSQ as i64 + 19,
+            900_000,
+            1_700_000,
+        ];
+        let sigma2 = [0, 55_000, 33_000, 2_400_000];
+        let sigma12 = [-13, 41_000, 12_000, 1_600_000];
+
+        let mut unit = RunningStatAccumulators::default();
+        process_sigma_row(
+            &sigma1,
+            &sigma2,
+            &sigma12,
+            VifGainLimitMode::Unit,
+            &mut unit,
+        );
+
+        let mut generic = RunningStatAccumulators::default();
+        process_sigma_row(
+            &sigma1,
+            &sigma2,
+            &sigma12,
+            VifGainLimitMode::Generic(1.0),
+            &mut generic,
+        );
+
+        assert_eq!(unit.accum_num_log, generic.accum_num_log);
+        assert_eq!(unit.accum_den_log, generic.accum_den_log);
+        assert_eq!(unit.accum_num_non_log, generic.accum_num_non_log);
+        assert_eq!(unit.accum_den_non_log, generic.accum_den_non_log);
     }
 }

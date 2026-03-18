@@ -1,6 +1,6 @@
 use vmaf_cpu::SimdBackend;
 
-use super::{ScaleStat, VifStatWorkspace};
+use super::{ScaleStat, VifGainLimitMode, VifStatWorkspace};
 
 pub(super) fn vif_statistic(
     ref_plane: &[u16],
@@ -9,7 +9,7 @@ pub(super) fn vif_statistic(
     height: usize,
     bpc: u8,
     scale: usize,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     workspace: &mut VifStatWorkspace,
     backend: SimdBackend,
 ) -> ScaleStat {
@@ -23,7 +23,7 @@ pub(super) fn vif_statistic(
         height,
         bpc,
         scale,
-        vif_enhn_gain_limit,
+        vif_gain_limit_mode,
         workspace,
     )
 }

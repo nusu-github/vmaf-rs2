@@ -6,10 +6,10 @@ use std::arch::x86_64::*;
 use vmaf_cpu::SimdBackend;
 
 use super::{
-    FILTER_TAP_CAP, RunningStatAccumulators, ScaleStat, finalize_scale_stat,
+    FILTER_TAP_CAP, RunningStatAccumulators, ScaleStat, VifGainLimitMode, finalize_scale_stat,
     horizontal_scalar_range, horizontal_simd_body_range, process_filtered_pixel,
-    process_sigma_values, reflected_row_offsets, stat_params, vertical_scalar_range_non_wrapping,
-    vertical_scalar_range_wrapping,
+    process_sigma_values_with_limit, reflected_row_offsets, stat_params,
+    vertical_scalar_range_non_wrapping, vertical_scalar_range_wrapping,
 };
 use crate::tables::{FILTER, FILTER_WIDTH};
 
@@ -26,7 +26,7 @@ pub(super) fn vif_statistic(
     height: usize,
     bpc: u8,
     scale: usize,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     workspace: &mut super::VifStatWorkspace,
     backend: SimdBackend,
 ) -> ScaleStat {
@@ -126,23 +126,73 @@ pub(super) fn vif_statistic(
         }
 
         match kernel {
-            X86StatKernel::Avx2 => {
-                // SAFETY: `select_kernel` only returns `Avx2` when runtime
-                // detection has already proved the current process supports AVX2.
-                unsafe {
-                    horizontal_row_avx2(
-                        tmp_mu1,
-                        tmp_mu2,
-                        tmp_ref_sq,
-                        tmp_dis_sq,
-                        tmp_ref_dis,
-                        filt,
-                        half,
-                        vif_enhn_gain_limit,
-                        &mut accum,
-                    );
+            X86StatKernel::Avx2 => match scale {
+                0 => {
+                    // SAFETY: `select_kernel` only returns `Avx2` when runtime
+                    // detection has already proved the current process supports AVX2.
+                    unsafe {
+                        horizontal_row_avx2::<17>(
+                            tmp_mu1,
+                            tmp_mu2,
+                            tmp_ref_sq,
+                            tmp_dis_sq,
+                            tmp_ref_dis,
+                            &FILTER[0],
+                            vif_gain_limit_mode,
+                            &mut accum,
+                        );
+                    }
                 }
-            }
+                1 => {
+                    // SAFETY: `select_kernel` only returns `Avx2` when runtime
+                    // detection has already proved the current process supports AVX2.
+                    unsafe {
+                        horizontal_row_avx2::<9>(
+                            tmp_mu1,
+                            tmp_mu2,
+                            tmp_ref_sq,
+                            tmp_dis_sq,
+                            tmp_ref_dis,
+                            &FILTER[1],
+                            vif_gain_limit_mode,
+                            &mut accum,
+                        );
+                    }
+                }
+                2 => {
+                    // SAFETY: `select_kernel` only returns `Avx2` when runtime
+                    // detection has already proved the current process supports AVX2.
+                    unsafe {
+                        horizontal_row_avx2::<5>(
+                            tmp_mu1,
+                            tmp_mu2,
+                            tmp_ref_sq,
+                            tmp_dis_sq,
+                            tmp_ref_dis,
+                            &FILTER[2],
+                            vif_gain_limit_mode,
+                            &mut accum,
+                        );
+                    }
+                }
+                3 => {
+                    // SAFETY: `select_kernel` only returns `Avx2` when runtime
+                    // detection has already proved the current process supports AVX2.
+                    unsafe {
+                        horizontal_row_avx2::<3>(
+                            tmp_mu1,
+                            tmp_mu2,
+                            tmp_ref_sq,
+                            tmp_dis_sq,
+                            tmp_ref_dis,
+                            &FILTER[3],
+                            vif_gain_limit_mode,
+                            &mut accum,
+                        );
+                    }
+                }
+                _ => unreachable!("invalid VIF scale"),
+            },
             X86StatKernel::Sse2 => {
                 // SAFETY: x86 dispatch only reaches this module after runtime
                 // detection confirmed at least SSE2 support.
@@ -155,7 +205,7 @@ pub(super) fn vif_statistic(
                         tmp_ref_dis,
                         filt,
                         half,
-                        vif_enhn_gain_limit,
+                        vif_gain_limit_mode,
                         &mut accum,
                     );
                 }
@@ -379,7 +429,7 @@ unsafe fn horizontal_row_sse2(
     tmp_ref_dis: &[u32],
     coeffs: &[u16],
     half: usize,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     accum: &mut RunningStatAccumulators,
 ) {
     let (body_start, simd_end) = horizontal_simd_body_range(tmp_mu1.len(), half, 4);
@@ -401,7 +451,7 @@ unsafe fn horizontal_row_sse2(
         half,
         0,
         body_start,
-        vif_enhn_gain_limit,
+        vif_gain_limit_mode,
         accum,
     );
 
@@ -490,7 +540,7 @@ unsafe fn horizontal_row_sse2(
                 acc_ref,
                 acc_dis,
                 acc_rdi,
-                vif_enhn_gain_limit,
+                vif_gain_limit_mode,
                 accum,
             );
         }
@@ -506,31 +556,32 @@ unsafe fn horizontal_row_sse2(
         half,
         simd_end,
         tmp_mu1.len(),
-        vif_enhn_gain_limit,
+        vif_gain_limit_mode,
         accum,
     );
 }
 
 /// SAFETY: the caller must ensure AVX2 is available on the current CPU.
 #[target_feature(enable = "avx2")]
-unsafe fn horizontal_row_avx2(
+unsafe fn horizontal_row_avx2<const TAPS: usize>(
     tmp_mu1: &[u16],
     tmp_mu2: &[u16],
     tmp_ref_sq: &[u32],
     tmp_dis_sq: &[u32],
     tmp_ref_dis: &[u32],
-    coeffs: &[u16],
-    half: usize,
-    vif_enhn_gain_limit: f64,
+    coeffs: &[u16; FILTER_TAP_CAP],
+    vif_gain_limit_mode: VifGainLimitMode,
     accum: &mut RunningStatAccumulators,
 ) {
+    let coeffs = &coeffs[..TAPS];
+    let half = TAPS / 2;
     let (body_start, simd_end) = horizontal_simd_body_range(tmp_mu1.len(), half, 8);
     let mul_round = _mm256_set1_epi64x(1i64 << 31);
     let filt_round = _mm256_set1_epi64x(32768);
     let zero = _mm256_setzero_si256();
-    let mut coeff32_vecs = [_mm256_setzero_si256(); FILTER_TAP_CAP];
+    let mut coeff32_vecs = [_mm256_setzero_si256(); TAPS];
 
-    for tap in 0..coeffs.len() {
+    for tap in 0..TAPS {
         coeff32_vecs[tap] = _mm256_set1_epi32(coeffs[tap] as i32);
     }
 
@@ -544,7 +595,7 @@ unsafe fn horizontal_row_avx2(
         half,
         0,
         body_start,
-        vif_enhn_gain_limit,
+        vif_gain_limit_mode,
         accum,
     );
 
@@ -559,7 +610,7 @@ unsafe fn horizontal_row_avx2(
         let mut acc_rdi_even = _mm256_setzero_si256();
         let mut acc_rdi_odd = _mm256_setzero_si256();
 
-        for tap in 0..coeffs.len() {
+        for tap in 0..TAPS {
             let base = base_start + tap;
             let coeff32 = coeff32_vecs[tap];
             let mu1_values =
@@ -621,22 +672,43 @@ unsafe fn horizontal_row_avx2(
         _mm256_storeu_si256(sigma2_odd_values.as_mut_ptr().cast(), sigma2_odd);
         _mm256_storeu_si256(sigma12_even_values.as_mut_ptr().cast(), sigma12_even);
         _mm256_storeu_si256(sigma12_odd_values.as_mut_ptr().cast(), sigma12_odd);
-
-        for pair in 0..4 {
-            process_sigma_values(
-                sigma1_even_values[pair],
-                sigma2_even_values[pair],
-                sigma12_even_values[pair],
-                vif_enhn_gain_limit,
-                accum,
-            );
-            process_sigma_values(
-                sigma1_odd_values[pair],
-                sigma2_odd_values[pair],
-                sigma12_odd_values[pair],
-                vif_enhn_gain_limit,
-                accum,
-            );
+        match vif_gain_limit_mode {
+            VifGainLimitMode::Unit => {
+                for pair in 0..4 {
+                    process_sigma_values_with_limit(
+                        sigma1_even_values[pair],
+                        sigma2_even_values[pair],
+                        sigma12_even_values[pair],
+                        1.0,
+                        accum,
+                    );
+                    process_sigma_values_with_limit(
+                        sigma1_odd_values[pair],
+                        sigma2_odd_values[pair],
+                        sigma12_odd_values[pair],
+                        1.0,
+                        accum,
+                    );
+                }
+            }
+            VifGainLimitMode::Generic(limit) => {
+                for pair in 0..4 {
+                    process_sigma_values_with_limit(
+                        sigma1_even_values[pair],
+                        sigma2_even_values[pair],
+                        sigma12_even_values[pair],
+                        limit,
+                        accum,
+                    );
+                    process_sigma_values_with_limit(
+                        sigma1_odd_values[pair],
+                        sigma2_odd_values[pair],
+                        sigma12_odd_values[pair],
+                        limit,
+                        accum,
+                    );
+                }
+            }
         }
     }
 
@@ -650,7 +722,7 @@ unsafe fn horizontal_row_avx2(
         half,
         simd_end,
         tmp_mu1.len(),
-        vif_enhn_gain_limit,
+        vif_gain_limit_mode,
         accum,
     );
 }
@@ -944,21 +1016,20 @@ mod tests {
             half,
             0,
             width,
-            100.0,
+            super::VifGainLimitMode::Generic(100.0),
             &mut scalar,
         );
 
         let mut simd = RunningStatAccumulators::default();
         unsafe {
-            super::horizontal_row_avx2(
+            super::horizontal_row_avx2::<17>(
                 &tmp_mu1,
                 &tmp_mu2,
                 &tmp_ref_sq,
                 &tmp_dis_sq,
                 &tmp_ref_dis,
-                filt,
-                half,
-                100.0,
+                &FILTER[0],
+                super::VifGainLimitMode::Generic(100.0),
                 &mut simd,
             );
         }
@@ -1024,21 +1095,20 @@ mod tests {
             half,
             0,
             width,
-            100.0,
+            super::VifGainLimitMode::Generic(100.0),
             &mut scalar,
         );
 
         let mut simd = RunningStatAccumulators::default();
         unsafe {
-            super::horizontal_row_avx2(
+            super::horizontal_row_avx2::<17>(
                 &tmp_mu1,
                 &tmp_mu2,
                 &tmp_ref_sq,
                 &tmp_dis_sq,
                 &tmp_ref_dis,
-                filt,
-                half,
-                100.0,
+                &FILTER[0],
+                super::VifGainLimitMode::Generic(100.0),
                 &mut simd,
             );
         }

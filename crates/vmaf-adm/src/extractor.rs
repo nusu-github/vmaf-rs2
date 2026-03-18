@@ -56,6 +56,20 @@ impl AdmWorkspace {
     }
 }
 
+#[inline]
+fn copy_i16_slice_as_i32(dst: &mut Vec<i32>, src: &[i16]) {
+    dst.clear();
+    dst.reserve(src.len().saturating_sub(dst.capacity()));
+    let spare = &mut dst.spare_capacity_mut()[..src.len()];
+    for (slot, value) in spare.iter_mut().zip(src.iter().copied()) {
+        slot.write(i32::from(value));
+    }
+    // SAFETY: each slot in the written prefix was initialized exactly once.
+    unsafe {
+        dst.set_len(src.len());
+    }
+}
+
 /// Stateless ADM extractor: computes the `adm2` score for one reference/distorted frame pair.
 pub struct AdmExtractor {
     width: usize,
@@ -162,14 +176,8 @@ impl AdmExtractor {
             h0,
         );
 
-        workspace.cur_ref_ll.clear();
-        workspace
-            .cur_ref_ll
-            .extend(workspace.ref_scale0.a.iter().map(|&x| x as i32));
-        workspace.cur_dis_ll.clear();
-        workspace
-            .cur_dis_ll
-            .extend(workspace.dis_scale0.a.iter().map(|&x| x as i32));
+        copy_i16_slice_as_i32(&mut workspace.cur_ref_ll, &workspace.ref_scale0.a);
+        copy_i16_slice_as_i32(&mut workspace.cur_dis_ll, &workspace.dis_scale0.a);
         let mut cur_w = w0;
         let mut cur_h = h0;
 

@@ -5,7 +5,7 @@ use vmaf_cpu::SimdBackend;
 
 use crate::{
     filter::{SubsampleWorkspace, subsample_into},
-    stat::{VifStatWorkspace, vif_statistic_with_workspace},
+    stat::{VifGainLimitMode, VifStatWorkspace, vif_statistic_with_workspace_mode},
 };
 
 const MIN_FRAME_DIMENSION: usize = 16;
@@ -55,7 +55,7 @@ impl VifWorkspace {
             dis_a: Vec::with_capacity(next_level_area),
             dis_b: Vec::with_capacity(next_level_area),
             stat: VifStatWorkspace::new(width),
-            subsample: SubsampleWorkspace::new(width * height),
+            subsample: SubsampleWorkspace::new(width),
         }
     }
 }
@@ -75,7 +75,7 @@ pub struct VifExtractor {
     width: usize,
     height: usize,
     bpc: u8,
-    vif_enhn_gain_limit: f64,
+    vif_gain_limit_mode: VifGainLimitMode,
     backend: SimdBackend,
 }
 
@@ -113,7 +113,7 @@ impl VifExtractor {
             width,
             height,
             bpc,
-            vif_enhn_gain_limit,
+            vif_gain_limit_mode: VifGainLimitMode::new(vif_enhn_gain_limit),
             backend: effective_backend(backend),
         })
     }
@@ -131,20 +131,20 @@ impl VifExtractor {
         dis_plane: &[u16],
     ) -> VifScores {
         let (w, h, bpc) = (self.width, self.height, self.bpc);
-        let limit = self.vif_enhn_gain_limit;
+        let gain_limit_mode = self.vif_gain_limit_mode;
         let backend = self.backend;
 
         let mut nums = [0.0f64; 4];
         let mut dens = [0.0f64; 4];
 
-        let s0 = vif_statistic_with_workspace(
+        let s0 = vif_statistic_with_workspace_mode(
             ref_plane,
             dis_plane,
             w,
             h,
             bpc,
             0,
-            limit,
+            gain_limit_mode,
             &mut workspace.stat,
             backend,
         );
@@ -171,14 +171,14 @@ impl VifExtractor {
                         &mut workspace.dis_a,
                     );
                     let next_len = next_w * next_h;
-                    let ss = vif_statistic_with_workspace(
+                    let ss = vif_statistic_with_workspace_mode(
                         &workspace.ref_a[..next_len],
                         &workspace.dis_a[..next_len],
                         next_w,
                         next_h,
                         bpc,
                         scale + 1,
-                        limit,
+                        gain_limit_mode,
                         &mut workspace.stat,
                         backend,
                     );
@@ -199,14 +199,14 @@ impl VifExtractor {
                         &mut workspace.dis_b,
                     );
                     let next_len = next_w * next_h;
-                    let ss = vif_statistic_with_workspace(
+                    let ss = vif_statistic_with_workspace_mode(
                         &workspace.ref_b[..next_len],
                         &workspace.dis_b[..next_len],
                         next_w,
                         next_h,
                         bpc,
                         scale + 1,
-                        limit,
+                        gain_limit_mode,
                         &mut workspace.stat,
                         backend,
                     );
@@ -227,14 +227,14 @@ impl VifExtractor {
                         &mut workspace.dis_a,
                     );
                     let next_len = next_w * next_h;
-                    let ss = vif_statistic_with_workspace(
+                    let ss = vif_statistic_with_workspace_mode(
                         &workspace.ref_a[..next_len],
                         &workspace.dis_a[..next_len],
                         next_w,
                         next_h,
                         bpc,
                         scale + 1,
-                        limit,
+                        gain_limit_mode,
                         &mut workspace.stat,
                         backend,
                     );

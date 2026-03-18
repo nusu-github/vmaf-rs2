@@ -18,13 +18,13 @@ const HORIZONTAL_ROUND: u32 = 32768;
 
 type AlignedVec32<T> = AVec<T, ConstAlign32>;
 
-/// Reusable aligned buffers for one subsampling step.
+/// Reusable aligned row buffers for one subsampling step.
 #[derive(Debug)]
 pub(crate) struct SubsampleWorkspace {
-    tmp_ref: AlignedVec32<u16>,
-    tmp_dis: AlignedVec32<u16>,
-    filt_ref: AlignedVec32<u16>,
-    filt_dis: AlignedVec32<u16>,
+    tmp_ref_row: AlignedVec32<u16>,
+    tmp_dis_row: AlignedVec32<u16>,
+    filt_ref_row: AlignedVec32<u16>,
+    filt_dis_row: AlignedVec32<u16>,
 }
 
 impl Default for SubsampleWorkspace {
@@ -34,27 +34,27 @@ impl Default for SubsampleWorkspace {
 }
 
 impl SubsampleWorkspace {
-    pub(crate) fn new(max_frame_len: usize) -> Self {
+    pub(crate) fn new(max_width: usize) -> Self {
         Self {
-            tmp_ref: avec_zeroed_32(max_frame_len),
-            tmp_dis: avec_zeroed_32(max_frame_len),
-            filt_ref: avec_zeroed_32(max_frame_len),
-            filt_dis: avec_zeroed_32(max_frame_len),
+            tmp_ref_row: avec_zeroed_32(max_width),
+            tmp_dis_row: avec_zeroed_32(max_width),
+            filt_ref_row: avec_zeroed_32(max_width),
+            filt_dis_row: avec_zeroed_32(max_width),
         }
     }
 
-    fn prepare(&mut self, frame_len: usize) {
-        if self.tmp_ref.len() < frame_len {
-            self.tmp_ref = avec_zeroed_32(frame_len);
+    fn prepare_rows(&mut self, width: usize) {
+        if self.tmp_ref_row.len() < width {
+            self.tmp_ref_row = avec_zeroed_32(width);
         }
-        if self.tmp_dis.len() < frame_len {
-            self.tmp_dis = avec_zeroed_32(frame_len);
+        if self.tmp_dis_row.len() < width {
+            self.tmp_dis_row = avec_zeroed_32(width);
         }
-        if self.filt_ref.len() < frame_len {
-            self.filt_ref = avec_zeroed_32(frame_len);
+        if self.filt_ref_row.len() < width {
+            self.filt_ref_row = avec_zeroed_32(width);
         }
-        if self.filt_dis.len() < frame_len {
-            self.filt_dis = avec_zeroed_32(frame_len);
+        if self.filt_dis_row.len() < width {
+            self.filt_dis_row = avec_zeroed_32(width);
         }
     }
 }
@@ -72,7 +72,7 @@ pub(crate) fn subsample(
     scale: usize,
     backend: SimdBackend,
 ) -> (Vec<u16>, Vec<u16>, usize, usize) {
-    let mut workspace = SubsampleWorkspace::new(width * height);
+    let mut workspace = SubsampleWorkspace::new(width);
     let mut out_ref = Vec::with_capacity((width / 2) * (height / 2));
     let mut out_dis = Vec::with_capacity((width / 2) * (height / 2));
     let (out_width, out_height) = subsample_into(
@@ -135,7 +135,9 @@ fn subsample_scalar_into(
 ) -> (usize, usize) {
     let filt = &FILTER[scale + 1][..FILTER_WIDTH[scale + 1]];
     let half = filt.len() / 2;
-    let frame_len = width * height;
+    let out_w = width / 2;
+    let out_h = height / 2;
+    let out_len = out_w * out_h;
 
     let (shift_v, round_v) = if scale == 0 {
         (bpc as u32, 1u32 << (bpc - 1))
@@ -143,15 +145,18 @@ fn subsample_scalar_into(
         (16u32, 32768u32)
     };
 
-    workspace.prepare(frame_len);
-    let tmp_ref = &mut workspace.tmp_ref.as_mut_slice()[..frame_len];
-    let tmp_dis = &mut workspace.tmp_dis.as_mut_slice()[..frame_len];
-    let filt_ref = &mut workspace.filt_ref.as_mut_slice()[..frame_len];
-    let filt_dis = &mut workspace.filt_dis.as_mut_slice()[..frame_len];
+    out_ref.resize(out_len, 0);
+    out_dis.resize(out_len, 0);
 
-    for i in 0..height {
-        let row_offsets = reflected_row_offsets(i, height, width, half, filt.len());
-        let row = i * width;
+    workspace.prepare_rows(width);
+    let tmp_ref_row = &mut workspace.tmp_ref_row.as_mut_slice()[..width];
+    let tmp_dis_row = &mut workspace.tmp_dis_row.as_mut_slice()[..width];
+    let filt_ref_row = &mut workspace.filt_ref_row.as_mut_slice()[..width];
+    let filt_dis_row = &mut workspace.filt_dis_row.as_mut_slice()[..width];
+
+    for out_i in 0..out_h {
+        let src_i = out_i * 2;
+        let row_offsets = reflected_row_offsets(src_i, height, width, half, filt.len());
         vertical_scalar_range(
             ref_in,
             dis_in,
@@ -161,26 +166,30 @@ fn subsample_scalar_into(
             round_v,
             0,
             width,
-            &mut tmp_ref[row..row + width],
-            &mut tmp_dis[row..row + width],
+            tmp_ref_row,
+            tmp_dis_row,
         );
-    }
-
-    for i in 0..height {
-        let row = i * width;
         horizontal_scalar_range(
-            &tmp_ref[row..row + width],
-            &tmp_dis[row..row + width],
+            tmp_ref_row,
+            tmp_dis_row,
             filt,
             half,
             0,
             width,
-            &mut filt_ref[row..row + width],
-            &mut filt_dis[row..row + width],
+            filt_ref_row,
+            filt_dis_row,
+        );
+
+        let dst_row = out_i * out_w;
+        decimate_filtered_row_into(
+            filt_ref_row,
+            filt_dis_row,
+            &mut out_ref[dst_row..dst_row + out_w],
+            &mut out_dis[dst_row..dst_row + out_w],
         );
     }
 
-    decimate_filtered_into(filt_ref, filt_dis, width, height, out_ref, out_dis)
+    (out_w, out_h)
 }
 
 #[inline]
@@ -273,30 +282,17 @@ fn horizontal_simd_body_range(width: usize, half: usize, lanes: usize) -> (usize
 }
 
 #[inline]
-fn decimate_filtered_into(
-    filt_ref: &[u16],
-    filt_dis: &[u16],
-    width: usize,
-    height: usize,
-    out_ref: &mut Vec<u16>,
-    out_dis: &mut Vec<u16>,
-) -> (usize, usize) {
-    let out_w = width / 2;
-    let out_h = height / 2;
-    let out_len = out_h * out_w;
-
-    out_ref.resize(out_len, 0);
-    out_dis.resize(out_len, 0);
-
-    for i in 0..out_h {
-        for j in 0..out_w {
-            let dst = i * out_w + j;
-            out_ref[dst] = filt_ref[(2 * i) * width + (2 * j)];
-            out_dis[dst] = filt_dis[(2 * i) * width + (2 * j)];
-        }
+fn decimate_filtered_row_into(
+    filt_ref_row: &[u16],
+    filt_dis_row: &[u16],
+    out_ref_row: &mut [u16],
+    out_dis_row: &mut [u16],
+) {
+    for (j, (dst_ref, dst_dis)) in out_ref_row.iter_mut().zip(out_dis_row).enumerate() {
+        let src = j * 2;
+        *dst_ref = filt_ref_row[src];
+        *dst_dis = filt_dis_row[src];
     }
-
-    (out_w, out_h)
 }
 
 #[cfg(test)]
@@ -331,7 +327,7 @@ mod tests {
             SimdBackend::Scalar,
         );
 
-        let mut workspace = SubsampleWorkspace::new(width * height);
+        let mut workspace = SubsampleWorkspace::new(width);
         let mut out_ref = Vec::new();
         let mut out_dis = Vec::new();
         let dims = subsample_into(

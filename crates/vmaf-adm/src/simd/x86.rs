@@ -46,12 +46,30 @@ fn write_i64_pairs_as_i32_uninit<const N: usize>(
 
 #[inline]
 fn push_i32_as_i16<const N: usize>(dst: &mut Vec<i16>, values: [i32; N]) {
-    dst.extend(values.into_iter().map(|value| value as i16));
+    dst.reserve(N);
+    let len = dst.len();
+    let spare = &mut dst.spare_capacity_mut()[..N];
+    for (slot, value) in spare.iter_mut().zip(values) {
+        slot.write(value as i16);
+    }
+    // SAFETY: we reserved at least `N` slots and initialized each one exactly once.
+    unsafe {
+        dst.set_len(len + N);
+    }
 }
 
 #[inline]
 fn push_i64_as_i32<const N: usize>(dst: &mut Vec<i32>, values: [i64; N]) {
-    dst.extend(values.into_iter().map(|value| value as i32));
+    dst.reserve(N);
+    let len = dst.len();
+    let spare = &mut dst.spare_capacity_mut()[..N];
+    for (slot, value) in spare.iter_mut().zip(values) {
+        slot.write(value as i32);
+    }
+    // SAFETY: we reserved at least `N` slots and initialized each one exactly once.
+    unsafe {
+        dst.set_len(len + N);
+    }
 }
 
 pub(crate) fn dwt_scale0_sse2_into(

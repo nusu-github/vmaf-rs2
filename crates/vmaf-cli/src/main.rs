@@ -1,11 +1,17 @@
 //! vmaf-cli — command-line interface for VMAF scoring
 
-use std::{io::Read, path::PathBuf, time::Instant};
+use std::{
+    io::Read,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
 
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
-use vmaf::{LoadModelError, PoolMethod, VmafContext, VmafError, VmafOptions, load_model};
+use vmaf::{
+    LoadModelError, PoolMethod, ProcessingTimings, VmafContext, VmafError, VmafOptions, load_model,
+};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "VMAF video quality metric")]
@@ -59,6 +65,51 @@ struct StreamMetadata {
 }
 
 type LumaPair = (Vec<u16>, Vec<u16>);
+
+#[derive(Debug)]
+struct LumaBatch {
+    pairs: Vec<LumaPair>,
+    len: usize,
+}
+
+impl LumaBatch {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity.max(1);
+        let mut pairs = Vec::with_capacity(capacity);
+        pairs.resize_with(capacity, || (Vec::new(), Vec::new()));
+        Self { pairs, len: 0 }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn is_full(&self) -> bool {
+        self.len == self.pairs.len()
+    }
+
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn active_pairs(&self) -> &[LumaPair] {
+        &self.pairs[..self.len]
+    }
+
+    fn next_slot_mut(&mut self) -> (&mut Vec<u16>, &mut Vec<u16>) {
+        debug_assert!(self.len < self.pairs.len());
+        let (reference, distorted) = &mut self.pairs[self.len];
+        (reference, distorted)
+    }
+
+    fn commit_slot(&mut self) {
+        self.len += 1;
+    }
+
+    fn clear(&mut self) {
+        self.len = 0;
+    }
+}
 
 #[derive(Debug, Error)]
 enum CliError {
@@ -141,15 +192,134 @@ enum MainError {
     ThreadPool(#[from] rayon::ThreadPoolBuildError),
 }
 
-fn luma_to_u16(y_plane: &[u8], bpc: u8) -> Vec<u16> {
-    if bpc == 8 {
-        y_plane.iter().map(|&b| b as u16).collect()
+#[derive(Debug, Clone, Copy, Default)]
+struct IoTimings {
+    frame_read: Duration,
+    luma_convert: Duration,
+}
+
+const TARGET_BATCH_BYTES: usize = 128 * 1024 * 1024;
+const TARGET_BATCH_FRAMES_PER_WORKER: usize = 2;
+
+fn hotspot_profile_enabled() -> bool {
+    std::env::var_os("VMAF_HOTSPOT_PROFILE").is_some()
+}
+
+fn compute_batch_size(width: usize, height: usize, worker_count: usize) -> usize {
+    let worker_count = worker_count.max(1);
+    if let Some(override_batch_size) = positive_usize_env("VMAF_BATCH_SIZE_OVERRIDE") {
+        return override_batch_size;
+    }
+    let desired = worker_count.saturating_mul(TARGET_BATCH_FRAMES_PER_WORKER);
+    let bytes_per_pair = width
+        .checked_mul(height)
+        .and_then(|area| area.checked_mul(std::mem::size_of::<u16>() * 2))
+        .unwrap_or(usize::MAX);
+    let memory_cap = if bytes_per_pair == 0 {
+        desired
     } else {
-        // 10/12-bit: little-endian u16 per sample
-        y_plane
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect()
+        (TARGET_BATCH_BYTES / bytes_per_pair).max(1)
+    };
+    desired.min(memory_cap).max(1)
+}
+
+fn positive_usize_env(key: &str) -> Option<usize> {
+    match std::env::var(key) {
+        Ok(value) => match value.parse::<usize>() {
+            Ok(parsed) if parsed > 0 => Some(parsed),
+            _ => {
+                eprintln!("ignoring {key}={value:?}: expected a positive integer");
+                None
+            }
+        },
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!("ignoring {key}: value is not valid UTF-8");
+            None
+        }
+    }
+}
+
+fn print_timing_line(label: &str, duration: Duration, total: Duration) {
+    let total_secs = total.as_secs_f64();
+    let percentage = if total_secs > 0.0 {
+        duration.as_secs_f64() / total_secs * 100.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "  {label:<24} {:>8.3} ms {:>6.2}%",
+        duration.as_secs_f64() * 1_000.0,
+        percentage
+    );
+}
+
+fn print_hotspot_summary(
+    total: Duration,
+    io: IoTimings,
+    batch_total: Duration,
+    processing: ProcessingTimings,
+    progress_update: Duration,
+    flush: Duration,
+    pool: Duration,
+) {
+    eprintln!(
+        "hotspot profile (processing total {:.3} ms)",
+        total.as_secs_f64() * 1_000.0
+    );
+    print_timing_line("read_frame", io.frame_read, total);
+    print_timing_line("luma_convert", io.luma_convert, total);
+    print_timing_line("batch_callback", batch_total, total);
+    print_timing_line("  batch.validate", processing.validation, total);
+    print_timing_line("  batch.features", processing.feature_extraction, total);
+    print_timing_line("  batch.motion", processing.motion, total);
+    print_timing_line("  batch.finalize", processing.finalize, total);
+    print_timing_line("  progress_update", progress_update, total);
+
+    let batch_accounted = processing.validation
+        + processing.feature_extraction
+        + processing.motion
+        + processing.finalize
+        + progress_update;
+    let batch_other = batch_total.saturating_sub(batch_accounted);
+    print_timing_line("  batch.other", batch_other, total);
+
+    print_timing_line("flush", flush, total);
+    print_timing_line("pool", pool, total);
+
+    let accounted = io.frame_read + io.luma_convert + batch_total + flush + pool;
+    let other = total.saturating_sub(accounted);
+    print_timing_line("other", other, total);
+}
+
+fn luma_to_u16_into(y_plane: &[u8], bpc: u8, out: &mut Vec<u16>) {
+    let sample_count = if bpc == 8 {
+        y_plane.len()
+    } else {
+        y_plane.len() / 2
+    };
+    out.clear();
+    if out.capacity() < sample_count {
+        out.reserve(sample_count - out.capacity());
+    }
+
+    let spare = &mut out.spare_capacity_mut()[..sample_count];
+    if bpc == 8 {
+        for (slot, value) in spare.iter_mut().zip(y_plane.iter().copied()) {
+            slot.write(u16::from(value));
+        }
+    } else {
+        let chunks = y_plane.chunks_exact(2);
+        debug_assert!(chunks.remainder().is_empty());
+        for (slot, chunk) in spare.iter_mut().zip(chunks) {
+            slot.write(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+    }
+
+    // SAFETY: the written prefix matches `sample_count`, and every slot in it
+    // was initialized exactly once above.
+    unsafe {
+        out.set_len(sample_count);
     }
 }
 
@@ -267,21 +437,33 @@ fn validate_stream_metadata(
     Ok(())
 }
 
-fn read_luma_pair<R1: Read, R2: Read>(
+fn read_luma_pair_into_with_timings<R1: Read, R2: Read>(
     ref_dec: &mut y4m::Decoder<R1>,
     dis_dec: &mut y4m::Decoder<R2>,
     bpc: u8,
     paired_frames: usize,
-) -> Result<Option<LumaPair>, CliError> {
+    reference_out: &mut Vec<u16>,
+    distorted_out: &mut Vec<u16>,
+    mut timings: Option<&mut IoTimings>,
+) -> Result<bool, CliError> {
+    let read_start = Instant::now();
     let ref_frame = ref_dec.read_frame();
     let dis_frame = dis_dec.read_frame();
+    if let Some(timings) = timings.as_mut() {
+        timings.frame_read += read_start.elapsed();
+    }
 
     match (ref_frame, dis_frame) {
-        (Ok(ref_frame), Ok(dis_frame)) => Ok(Some((
-            luma_to_u16(ref_frame.get_y_plane(), bpc),
-            luma_to_u16(dis_frame.get_y_plane(), bpc),
-        ))),
-        (Err(y4m::Error::EOF), Err(y4m::Error::EOF)) => Ok(None),
+        (Ok(ref_frame), Ok(dis_frame)) => {
+            let convert_start = Instant::now();
+            luma_to_u16_into(ref_frame.get_y_plane(), bpc, reference_out);
+            luma_to_u16_into(dis_frame.get_y_plane(), bpc, distorted_out);
+            if let Some(timings) = timings.as_mut() {
+                timings.luma_convert += convert_start.elapsed();
+            }
+            Ok(true)
+        }
+        (Err(y4m::Error::EOF), Err(y4m::Error::EOF)) => Ok(false),
         (Err(y4m::Error::EOF), Ok(_)) => Err(CliError::AsymmetricEof {
             stream: "reference",
             paired_frames,
@@ -310,7 +492,7 @@ fn read_luma_pair<R1: Read, R2: Read>(
 }
 
 fn flush_batch<F, E>(
-    batch: &mut Vec<(Vec<u16>, Vec<u16>)>,
+    batch: &mut LumaBatch,
     frame_count: &mut usize,
     on_batch: &mut F,
 ) -> Result<(), FrameProcessingError<E>>
@@ -323,11 +505,12 @@ where
     }
 
     let refs: Vec<(&[u16], &[u16])> = batch
+        .active_pairs()
         .iter()
         .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
         .collect();
     let new_frame_count = *frame_count + batch.len();
-    on_batch(&refs, new_frame_count).map_err(FrameProcessingError::Callback)?;
+    on_batch(refs.as_slice(), new_frame_count).map_err(FrameProcessingError::Callback)?;
     *frame_count = new_frame_count;
     batch.clear();
     Ok(())
@@ -338,6 +521,21 @@ fn process_stream_frames<R1: Read, R2: Read, F, E>(
     dis_dec: &mut y4m::Decoder<R2>,
     bpc: u8,
     batch_size: usize,
+    on_batch: F,
+) -> Result<usize, FrameProcessingError<E>>
+where
+    F: FnMut(&[(&[u16], &[u16])], usize) -> Result<(), E>,
+    E: std::error::Error + 'static,
+{
+    process_stream_frames_with_timings(ref_dec, dis_dec, bpc, batch_size, None, on_batch)
+}
+
+fn process_stream_frames_with_timings<R1: Read, R2: Read, F, E>(
+    ref_dec: &mut y4m::Decoder<R1>,
+    dis_dec: &mut y4m::Decoder<R2>,
+    bpc: u8,
+    batch_size: usize,
+    mut timings: Option<&mut IoTimings>,
     mut on_batch: F,
 ) -> Result<usize, FrameProcessingError<E>>
 where
@@ -345,12 +543,30 @@ where
     E: std::error::Error + 'static,
 {
     let batch_size = batch_size.max(1);
-    let mut batch = Vec::with_capacity(batch_size);
+    let mut batch = LumaBatch::new(batch_size);
     let mut frame_count = 0usize;
 
-    while let Some(pair) = read_luma_pair(ref_dec, dis_dec, bpc, frame_count + batch.len())? {
-        batch.push(pair);
-        if batch.len() >= batch_size {
+    loop {
+        let paired_frames = frame_count + batch.len();
+        let has_pair = {
+            let (reference, distorted) = batch.next_slot_mut();
+            read_luma_pair_into_with_timings(
+                ref_dec,
+                dis_dec,
+                bpc,
+                paired_frames,
+                reference,
+                distorted,
+                timings.as_deref_mut(),
+            )?
+        };
+
+        if !has_pair {
+            break;
+        }
+
+        batch.commit_slot();
+        if batch.is_full() {
             flush_batch(&mut batch, &mut frame_count, &mut on_batch)?;
         }
     }
@@ -404,6 +620,7 @@ fn make_progress_bar() -> ProgressBar {
 
 fn main() -> Result<(), MainError> {
     let args = Args::parse();
+    let hotspot_profile = hotspot_profile_enabled();
 
     if !args.quiet {
         eprintln!("VMAF version {}", env!("CARGO_PKG_VERSION"));
@@ -445,36 +662,92 @@ fn main() -> Result<(), MainError> {
         make_progress_bar()
     };
 
-    let batch_size = if args.threads > 0 {
-        args.threads * 2
+    let worker_count = if args.threads > 0 {
+        args.threads
     } else {
-        rayon::current_num_threads() * 2
+        rayon::current_num_threads()
     };
+    let batch_size = compute_batch_size(ref_meta.width, ref_meta.height, worker_count);
     let start = Instant::now();
+    let mut io_timings = IoTimings::default();
+    let mut processing_timings = ProcessingTimings::default();
+    let mut batch_total = Duration::ZERO;
+    let mut progress_update = Duration::ZERO;
 
-    if let Err(err) = process_stream_frames(
-        &mut ref_dec,
-        &mut dis_dec,
-        ref_meta.bit_depth,
-        batch_size,
-        |refs, frame_count| {
+    let mut handle_batch = |refs: &[(&[u16], &[u16])], frame_count: usize| {
+        let batch_start = Instant::now();
+        if hotspot_profile {
+            let (_scores, timings) = ctx.push_frame_batch_with_timings(refs)?;
+            processing_timings += timings;
+        } else {
             ctx.push_frame_batch(refs)?;
-            pb.set_position(frame_count as u64);
-            let elapsed = start.elapsed().as_secs_f64();
-            if elapsed > 0.0 {
-                pb.set_message(format!("{:.2} FPS", frame_count as f64 / elapsed));
-            }
-            Ok::<_, vmaf::VmafError>(())
-        },
-    ) {
+        }
+
+        let progress_start = Instant::now();
+        pb.set_position(frame_count as u64);
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            pb.set_message(format!("{:.2} FPS", frame_count as f64 / elapsed));
+        }
+        if hotspot_profile {
+            progress_update += progress_start.elapsed();
+            batch_total += batch_start.elapsed();
+        }
+        Ok::<_, vmaf::VmafError>(())
+    };
+
+    let process_result = if hotspot_profile {
+        process_stream_frames_with_timings(
+            &mut ref_dec,
+            &mut dis_dec,
+            ref_meta.bit_depth,
+            batch_size,
+            Some(&mut io_timings),
+            &mut handle_batch,
+        )
+    } else {
+        process_stream_frames(
+            &mut ref_dec,
+            &mut dis_dec,
+            ref_meta.bit_depth,
+            batch_size,
+            &mut handle_batch,
+        )
+    };
+
+    if let Err(err) = process_result {
         pb.finish_and_clear();
         return Err(err.into());
     }
 
+    let flush_start = Instant::now();
     ctx.flush()?;
+    let flush_time = if hotspot_profile {
+        flush_start.elapsed()
+    } else {
+        Duration::ZERO
+    };
     pb.finish();
 
+    let pool_start = Instant::now();
     let pooled = ctx.pool_score(pool_method, args.n_subsample);
+    let pool_time = if hotspot_profile {
+        pool_start.elapsed()
+    } else {
+        Duration::ZERO
+    };
+
+    if hotspot_profile {
+        print_hotspot_summary(
+            start.elapsed(),
+            io_timings,
+            batch_total,
+            processing_timings,
+            progress_update,
+            flush_time,
+            pool_time,
+        );
+    }
 
     if args.json {
         emit_full_json(&ctx, pooled, &args.pool_method);
@@ -603,6 +876,18 @@ mod tests {
         assert!(help.contains("--quiet"));
         assert!(help.contains("no-progress"));
         assert!(help.contains("--json"));
+    }
+
+    #[test]
+    fn compute_batch_size_scales_up_small_inputs() {
+        assert_eq!(compute_batch_size(16, 16, 8), 16);
+        assert_eq!(compute_batch_size(16, 16, 1), 2);
+    }
+
+    #[test]
+    fn compute_batch_size_caps_large_inputs_by_memory() {
+        assert_eq!(compute_batch_size(1920, 1080, 8), 16);
+        assert_eq!(compute_batch_size(3840, 2160, 8), 4);
     }
 
     #[test]
