@@ -1,18 +1,17 @@
-use vmaf_cpu::SimdBackend;
-
-use crate::tables::{FILTER, FILTER_WIDTH};
-
-use super::{
-    finalize_scale_stat, horizontal_scalar_range, horizontal_simd_body_range,
-    process_filtered_pixel, process_sigma_values, reflected_row_offsets, stat_params,
-    vertical_scalar_range_non_wrapping, vertical_scalar_range_wrapping, RunningStatAccumulators,
-    ScaleStat, FILTER_TAP_CAP,
-};
-
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+use vmaf_cpu::SimdBackend;
+
+use super::{
+    FILTER_TAP_CAP, RunningStatAccumulators, ScaleStat, finalize_scale_stat,
+    horizontal_scalar_range, horizontal_simd_body_range, process_filtered_pixel,
+    process_sigma_values, reflected_row_offsets, stat_params, vertical_scalar_range_non_wrapping,
+    vertical_scalar_range_wrapping,
+};
+use crate::tables::{FILTER, FILTER_WIDTH};
 
 #[derive(Clone, Copy)]
 enum X86StatKernel {
@@ -713,13 +712,13 @@ unsafe fn store_interleaved_u64x4_as_u32_avx2(
 
 #[cfg(test)]
 mod tests {
-    use super::{vertical_row_non_wrapping_avx2, vertical_row_wrapping_avx2, FILTER, FILTER_WIDTH};
-    use crate::stat::{
-        horizontal_scalar_range, reflected_row_offsets, stat_params,
-        vertical_scalar_range_non_wrapping, vertical_scalar_range_wrapping,
-        RunningStatAccumulators,
-    };
     use vmaf_cpu::SimdBackend;
+
+    use super::{FILTER, FILTER_WIDTH, vertical_row_non_wrapping_avx2, vertical_row_wrapping_avx2};
+    use crate::stat::{
+        RunningStatAccumulators, horizontal_scalar_range, reflected_row_offsets, stat_params,
+        vertical_scalar_range_non_wrapping, vertical_scalar_range_wrapping,
+    };
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)

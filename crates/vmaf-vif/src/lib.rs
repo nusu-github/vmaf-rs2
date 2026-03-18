@@ -15,12 +15,15 @@ pub use extractor::{VifError, VifExtractor, VifScores, VifWorkspace};
 
 #[cfg(test)]
 mod tests {
-    use super::extractor::VifExtractor;
-    use super::filter::subsample;
-    use super::math::{log2_32, log2_64, reflect_index};
-    use super::stat::vif_statistic;
-    use super::tables::LOG2_TABLE;
     use vmaf_cpu::SimdBackend;
+
+    use super::{
+        extractor::VifExtractor,
+        filter::subsample,
+        math::{log2_32, log2_64, reflect_index},
+        stat::vif_statistic,
+        tables::LOG2_TABLE,
+    };
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)

@@ -1,8 +1,9 @@
-use crate::dwt::{
-    dwt_s123_into as scalar_dwt_s123_into, dwt_scale0_into as scalar_dwt_scale0_into, Bands16,
-    Bands16Buffer, Bands32, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace,
-};
 use vmaf_cpu::SimdBackend;
+
+use crate::dwt::{
+    Bands16, Bands16Buffer, Bands32, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace,
+    dwt_s123_into as scalar_dwt_s123_into, dwt_scale0_into as scalar_dwt_scale0_into,
+};
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64;

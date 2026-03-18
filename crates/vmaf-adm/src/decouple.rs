@@ -1,7 +1,6 @@
 //! Integer angle-based masking (decouple) — spec §4.3.8
 
-use crate::dwt::get_best15_from32;
-use crate::tables::DIV_LOOKUP;
+use crate::{dwt::get_best15_from32, tables::DIV_LOOKUP};
 
 // ── Scale 0 (int16) ──────────────────────────────────────────────────────────
 

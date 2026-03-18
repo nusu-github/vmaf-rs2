@@ -1,17 +1,16 @@
-use vmaf_cpu::SimdBackend;
-
-use crate::tables::{FILTER, FILTER_WIDTH};
-
-use super::{
-    decimate_filtered_into, horizontal_scalar_range, horizontal_simd_body_range,
-    reflected_row_offsets, vertical_scalar_range, SubsampleWorkspace, FILTER_TAP_CAP,
-    HORIZONTAL_ROUND, HORIZONTAL_SHIFT,
-};
-
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+
+use vmaf_cpu::SimdBackend;
+
+use super::{
+    FILTER_TAP_CAP, HORIZONTAL_ROUND, HORIZONTAL_SHIFT, SubsampleWorkspace, decimate_filtered_into,
+    horizontal_scalar_range, horizontal_simd_body_range, reflected_row_offsets,
+    vertical_scalar_range,
+};
+use crate::tables::{FILTER, FILTER_WIDTH};
 
 enum X86FilterKernel {
     Sse2,

@@ -1,6 +1,9 @@
 //! LIBSVM embedded text format parser — spec §3.3
 
-use crate::model::{SupportVector, SvmModel};
+use crate::{
+    error::LibsvmParseError,
+    model::{SupportVector, SvmModel},
+};
 
 /// Parse the embedded LIBSVM text string from the model JSON — spec §3.3.
 ///
@@ -16,7 +19,7 @@ use crate::model::{SupportVector, SvmModel};
 /// <coef> 1:<v1> 2:<v2> 3:<v3> 4:<v4> 5:<v5> 6:<v6>
 /// ...
 /// ```
-pub fn parse_libsvm(text: &str) -> Result<SvmModel, String> {
+pub fn parse_libsvm(text: &str) -> Result<SvmModel, LibsvmParseError> {
     let mut gamma = None::<f64>;
     let mut rho = None::<f64>;
     let mut support_vectors = Vec::new();
@@ -40,16 +43,24 @@ pub fn parse_libsvm(text: &str) -> Result<SvmModel, String> {
 
         // Header key-value pairs
         if let Some(v) = line.strip_prefix("gamma ") {
-            gamma = Some(v.trim().parse().map_err(|e| format!("gamma: {e}"))?);
+            gamma = Some(
+                v.trim()
+                    .parse()
+                    .map_err(|source| LibsvmParseError::GammaParse { source })?,
+            );
         } else if let Some(v) = line.strip_prefix("rho ") {
-            rho = Some(v.trim().parse().map_err(|e| format!("rho: {e}"))?);
+            rho = Some(
+                v.trim()
+                    .parse()
+                    .map_err(|source| LibsvmParseError::RhoParse { source })?,
+            );
         }
         // svm_type, kernel_type, nr_class, total_sv are informational; skip.
     }
 
     Ok(SvmModel {
-        gamma: gamma.ok_or("missing gamma")?,
-        rho: rho.ok_or("missing rho")?,
+        gamma: gamma.ok_or(LibsvmParseError::MissingGamma)?,
+        rho: rho.ok_or(LibsvmParseError::MissingRho)?,
         support_vectors,
     })
 }
@@ -57,23 +68,29 @@ pub fn parse_libsvm(text: &str) -> Result<SvmModel, String> {
 /// Parse one SV line: `<coef> 1:<v1> 2:<v2> … 6:<v6>`
 ///
 /// Missing feature indices default to 0.0 (spec §3.3).
-fn parse_sv_line(line: &str) -> Result<SupportVector, String> {
+fn parse_sv_line(line: &str) -> Result<SupportVector, LibsvmParseError> {
     let mut parts = line.split_whitespace();
     let coef: f64 = parts
         .next()
-        .ok_or("empty SV line")?
+        .ok_or(LibsvmParseError::EmptySupportVectorLine)?
         .parse()
-        .map_err(|e| format!("coef: {e}"))?;
+        .map_err(|source| LibsvmParseError::CoefficientParse { source })?;
 
     let mut values = [0.0_f64; 6];
     for tok in parts {
-        let (idx_s, val_s) = tok
-            .split_once(':')
-            .ok_or_else(|| format!("bad token: {tok}"))?;
-        let idx: usize = idx_s.parse().map_err(|e| format!("index: {e}"))?;
-        let val: f64 = val_s.parse().map_err(|e| format!("value: {e}"))?;
+        let (idx_s, val_s) =
+            tok.split_once(':')
+                .ok_or_else(|| LibsvmParseError::InvalidSupportVectorToken {
+                    token: tok.to_string(),
+                })?;
+        let idx: usize = idx_s
+            .parse()
+            .map_err(|source| LibsvmParseError::FeatureIndexParse { source })?;
+        let val: f64 = val_s
+            .parse()
+            .map_err(|source| LibsvmParseError::FeatureValueParse { source })?;
         if !(1..=6).contains(&idx) {
-            return Err(format!("feature index {idx} out of range 1–6"));
+            return Err(LibsvmParseError::FeatureIndexOutOfRange { idx });
         }
         values[idx - 1] = val;
     }
@@ -84,6 +101,7 @@ fn parse_sv_line(line: &str) -> Result<SupportVector, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LibsvmParseError;
 
     const MINIMAL_MODEL: &str = "\
 svm_type nu_svr
@@ -134,6 +152,9 @@ SV
     #[test]
     fn parse_error_missing_gamma() {
         let text = "rho 0.5\nSV\n1.0 1:0.5\n";
-        assert!(parse_libsvm(text).is_err());
+        assert!(matches!(
+            parse_libsvm(text),
+            Err(LibsvmParseError::MissingGamma)
+        ));
     }
 }

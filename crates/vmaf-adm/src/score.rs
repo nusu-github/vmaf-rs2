@@ -7,8 +7,10 @@
 
 use std::mem::MaybeUninit;
 
-use crate::decouple::{decouple_s123, decouple_scale0};
-use crate::noise_floor;
+use crate::{
+    decouple::{decouple_s123, decouple_scale0},
+    noise_floor,
+};
 
 const ADM_BORDER_FACTOR: f64 = 0.1;
 

@@ -5,5 +5,7 @@ edition = "2021"
 
 # Shared CPU feature detection, backend selection, and alignment helpers.
 [dependencies]
+aligned-vec = { workspace = true }
 bytemuck = { workspace = true }
 cpufeatures = { workspace = true }
+thiserror = { workspace = true }

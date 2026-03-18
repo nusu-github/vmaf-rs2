@@ -1,71 +1,45 @@
 //! vmaf — public API and pipeline orchestration — spec §2
 #![deny(unsafe_code)]
 
-use std::{error::Error, fmt};
+use thiserror::Error;
 use vmaf_adm::{AdmError, AdmExtractor, AdmWorkspace};
+pub use vmaf_model::{
+    LibsvmParseError, LoadModelError, ModelValidationError, PoolMethod, VmafModel, load_model,
+};
 use vmaf_model::{
     collect_scores, denormalize, normalize_features, pool, score_transform, svm_predict,
 };
 use vmaf_motion::{MotionError, MotionExtractor};
 use vmaf_vif::{VifError, VifExtractor, VifWorkspace};
 
-pub use vmaf_model::{load_model, PoolMethod, VmafModel};
-
 const MIN_FRAME_DIMENSION: usize = 16;
 
 /// Errors produced by [`VmafContext`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VmafError {
     /// Width or height is below the minimum required by the spec kernels.
+    #[error(
+        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+    )]
     InvalidDimensions { width: usize, height: usize },
     /// Bit depth is not supported by the integer pipeline.
+    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
     InvalidBitDepth { bpc: u8 },
     /// Width × height overflowed `usize`.
+    #[error("sample count overflow for dimensions {width}x{height}")]
     SampleCountOverflow { width: usize, height: usize },
     /// Reference plane length does not match the configured frame size.
+    #[error("invalid reference plane length {actual}: expected exactly {required} samples")]
     InvalidReferenceLength { actual: usize, required: usize },
     /// Distorted plane length does not match the configured frame size.
+    #[error("invalid distorted plane length {actual}: expected exactly {required} samples")]
     InvalidDistortedLength { actual: usize, required: usize },
     /// The context has already been flushed and is now terminal.
+    #[error("vmaf context has already been flushed")]
     AlreadyFlushed,
     /// A lower-level motion error that should be surfaced to callers.
+    #[error(transparent)]
     Motion(MotionError),
-}
-
-impl fmt::Display for VmafError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidDimensions { width, height } => write!(
-                f,
-                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-            ),
-            Self::InvalidBitDepth { bpc } => {
-                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
-            }
-            Self::SampleCountOverflow { width, height } => {
-                write!(f, "sample count overflow for dimensions {width}x{height}")
-            }
-            Self::InvalidReferenceLength { actual, required } => write!(
-                f,
-                "invalid reference plane length {actual}: expected exactly {required} samples"
-            ),
-            Self::InvalidDistortedLength { actual, required } => write!(
-                f,
-                "invalid distorted plane length {actual}: expected exactly {required} samples"
-            ),
-            Self::AlreadyFlushed => write!(f, "vmaf context has already been flushed"),
-            Self::Motion(err) => err.fmt(f),
-        }
-    }
-}
-
-impl Error for VmafError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::Motion(err) => Some(err),
-            _ => None,
-        }
-    }
 }
 
 impl From<VifError> for VmafError {

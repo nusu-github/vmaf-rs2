@@ -1,8 +1,12 @@
 //! VIF statistic core — spec §4.2.6–4.2.8
 
-use crate::math::{log2_32, log2_64, reflect_index};
-use crate::tables::{FILTER, FILTER_WIDTH, LOG2_TABLE};
-use vmaf_cpu::{Align32, AlignedScratch, SimdBackend};
+use aligned_vec::AVec;
+use vmaf_cpu::{ConstAlign32, SimdBackend, avec_zeroed_32};
+
+use crate::{
+    math::{log2_32, log2_64, reflect_index},
+    tables::{FILTER, FILTER_WIDTH, LOG2_TABLE},
+};
 
 mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -11,6 +15,8 @@ mod x86;
 const FILTER_TAP_CAP: usize = 18;
 const SIGMA_NSQ: u32 = 131072; // 2^17
 const EPSILON: f64 = 65536.0 * 1e-10; // ≈ 6.5536e-6
+
+type AlignedVec32<T> = AVec<T, ConstAlign32>;
 
 /// Per-scale VIF numerator and denominator — spec §4.2.8.
 pub(crate) struct ScaleStat {
@@ -21,11 +27,11 @@ pub(crate) struct ScaleStat {
 /// Reusable aligned row buffers for one VIF statistic pass.
 #[derive(Debug)]
 pub(crate) struct VifStatWorkspace {
-    tmp_mu1: AlignedScratch<u16, Align32>,
-    tmp_mu2: AlignedScratch<u16, Align32>,
-    tmp_ref_sq: AlignedScratch<u32, Align32>,
-    tmp_dis_sq: AlignedScratch<u32, Align32>,
-    tmp_ref_dis: AlignedScratch<u32, Align32>,
+    tmp_mu1: AlignedVec32<u16>,
+    tmp_mu2: AlignedVec32<u16>,
+    tmp_ref_sq: AlignedVec32<u32>,
+    tmp_dis_sq: AlignedVec32<u32>,
+    tmp_ref_dis: AlignedVec32<u32>,
 }
 
 impl Default for VifStatWorkspace {
@@ -37,29 +43,29 @@ impl Default for VifStatWorkspace {
 impl VifStatWorkspace {
     pub(crate) fn new(max_width: usize) -> Self {
         Self {
-            tmp_mu1: AlignedScratch::zeroed(max_width),
-            tmp_mu2: AlignedScratch::zeroed(max_width),
-            tmp_ref_sq: AlignedScratch::zeroed(max_width),
-            tmp_dis_sq: AlignedScratch::zeroed(max_width),
-            tmp_ref_dis: AlignedScratch::zeroed(max_width),
+            tmp_mu1: avec_zeroed_32(max_width),
+            tmp_mu2: avec_zeroed_32(max_width),
+            tmp_ref_sq: avec_zeroed_32(max_width),
+            tmp_dis_sq: avec_zeroed_32(max_width),
+            tmp_ref_dis: avec_zeroed_32(max_width),
         }
     }
 
     fn prepare(&mut self, width: usize) {
         if self.tmp_mu1.len() < width {
-            self.tmp_mu1 = AlignedScratch::zeroed(width);
+            self.tmp_mu1 = avec_zeroed_32(width);
         }
         if self.tmp_mu2.len() < width {
-            self.tmp_mu2 = AlignedScratch::zeroed(width);
+            self.tmp_mu2 = avec_zeroed_32(width);
         }
         if self.tmp_ref_sq.len() < width {
-            self.tmp_ref_sq = AlignedScratch::zeroed(width);
+            self.tmp_ref_sq = avec_zeroed_32(width);
         }
         if self.tmp_dis_sq.len() < width {
-            self.tmp_dis_sq = AlignedScratch::zeroed(width);
+            self.tmp_dis_sq = avec_zeroed_32(width);
         }
         if self.tmp_ref_dis.len() < width {
-            self.tmp_ref_dis = AlignedScratch::zeroed(width);
+            self.tmp_ref_dis = avec_zeroed_32(width);
         }
     }
 }
@@ -499,8 +505,9 @@ fn finalize_scale_stat(accum: RunningStatAccumulators) -> ScaleStat {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use vmaf_cpu::SimdBackend;
+
+    use super::*;
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)

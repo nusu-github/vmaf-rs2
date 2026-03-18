@@ -1,8 +1,10 @@
 [package]
-name    = "vmaf-motion"
+name = "vmaf-motion"
 version = "0.1.0"
 edition = "2021"
 
 # §4.4 Integer Motion — shared CPU backend selection for runtime SIMD dispatch.
 [dependencies]
+aligned-vec = { workspace = true }
+thiserror = { workspace = true }
 vmaf-cpu = { workspace = true }

@@ -15,6 +15,9 @@ mod probe;
 
 pub use alignment::{
     Align16, Align32, Align64, AlignedAllocError, AlignedBlock, AlignedScratch, Alignment,
+    ConstAlign16, ConstAlign32, ConstAlign64, assume_init_slice, avec_assume_init, avec_uninit,
+    avec_uninit_32, avec_uninit_64, avec_zeroed, avec_zeroed_32, avec_zeroed_64, try_avec_uninit,
+    try_avec_zeroed,
 };
 pub use backend::SimdBackend;
 pub use bytemuck::{AnyBitPattern, NoUninit, Pod, PodCastError, Zeroable};

@@ -3,8 +3,11 @@
 use serde::Deserialize;
 use serde_json::{Map, Value};
 
-use crate::libsvm::parse_libsvm;
-use crate::model::{ScoreTransform, VmafModel};
+use crate::{
+    error::{LoadModelError, ModelValidationError},
+    libsvm::parse_libsvm,
+    model::{ScoreTransform, VmafModel},
+};
 
 // ---------- serde shapes ----------
 
@@ -37,12 +40,15 @@ fn de_bool_or_str<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Err
     struct V;
     impl<'de> serde::de::Visitor<'de> for V {
         type Value = bool;
+
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("bool or string \"true\"/\"false\"")
         }
+
         fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<bool, E> {
             Ok(v)
         }
+
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<bool, E> {
             match v {
                 "true" => Ok(true),
@@ -100,10 +106,13 @@ fn validate_feature_name(idx: usize, name: &str) -> bool {
     }
 }
 
-fn validate_feature_names(names: &[String; 6]) -> Result<(), String> {
+fn validate_feature_names(names: &[String; 6]) -> Result<(), ModelValidationError> {
     for (i, name) in names.iter().enumerate() {
         if !validate_feature_name(i, name) {
-            return Err(format!("unsupported feature_names[{i}] = {name}"));
+            return Err(ModelValidationError::UnsupportedFeatureName {
+                idx: i,
+                name: name.clone(),
+            });
         }
     }
     Ok(())
@@ -120,44 +129,40 @@ fn json_type_name(v: &Value) -> &'static str {
     }
 }
 
-fn parse_gain_limit(v: &Value, key: &str, idx: usize) -> Result<f64, String> {
+fn parse_gain_limit(v: &Value, key: &'static str, idx: usize) -> Result<f64, ModelValidationError> {
     let n = match v {
-        Value::Number(num) => num.as_f64().ok_or_else(|| {
-            format!("feature_opts_dicts[{idx}].{key} is not representable as f64")
-        })?,
+        Value::Number(num) => num
+            .as_f64()
+            .ok_or(ModelValidationError::GainLimitNotRepresentable { idx, key })?,
         other => {
-            return Err(format!(
-                "feature_opts_dicts[{idx}].{key} must be a JSON number, got {}",
-                json_type_name(other)
-            ));
+            return Err(ModelValidationError::GainLimitType {
+                idx,
+                key,
+                found: json_type_name(other),
+            });
         }
     };
 
     if !n.is_finite() {
-        return Err(format!("feature_opts_dicts[{idx}].{key} must be finite"));
+        return Err(ModelValidationError::GainLimitNonFinite { idx, key });
     }
     if n < 1.0 {
-        return Err(format!("feature_opts_dicts[{idx}].{key} must be >= 1.0"));
+        return Err(ModelValidationError::GainLimitTooSmall { idx, key });
     }
     Ok(n)
 }
 
-fn validate_score_clip(score_clip: [f64; 2]) -> Result<(), String> {
+fn validate_score_clip(score_clip: [f64; 2]) -> Result<(), ModelValidationError> {
     let [lower, upper] = score_clip;
     if lower > upper {
-        return Err(format!(
-            "score_clip lower bound ({lower}) must be <= upper bound ({upper})"
-        ));
+        return Err(ModelValidationError::InvalidScoreClipBounds { lower, upper });
     }
     Ok(())
 }
 
-fn validate_knots(knots: &[[f64; 2]]) -> Result<(), String> {
+fn validate_knots(knots: &[[f64; 2]]) -> Result<(), ModelValidationError> {
     if knots.len() < 2 {
-        return Err(format!(
-            "score_transform.knots must have at least 2 points, got {}",
-            knots.len()
-        ));
+        return Err(ModelValidationError::TooFewScoreTransformKnots { len: knots.len() });
     }
 
     for (idx, pair) in knots.windows(2).enumerate() {
@@ -165,24 +170,24 @@ fn validate_knots(knots: &[[f64; 2]]) -> Result<(), String> {
         let [x1, y1] = pair[1];
 
         if x1 <= x0 {
-            return Err(format!(
-                "score_transform.knots x values must be strictly increasing between points {idx} and {}",
-                idx + 1
-            ));
+            return Err(ModelValidationError::NonIncreasingScoreTransformX {
+                idx,
+                next_idx: idx + 1,
+            });
         }
 
         if y1 < y0 {
-            return Err(format!(
-                "score_transform.knots y values must be nondecreasing between points {idx} and {}",
-                idx + 1
-            ));
+            return Err(ModelValidationError::DecreasingScoreTransformY {
+                idx,
+                next_idx: idx + 1,
+            });
         }
     }
 
     Ok(())
 }
 
-fn validate_score_transform(st: &ScoreTransformJson) -> Result<(), String> {
+fn validate_score_transform(st: &ScoreTransformJson) -> Result<(), ModelValidationError> {
     if let Some(knots) = st.knots.as_deref() {
         validate_knots(knots)?;
     }
@@ -191,30 +196,34 @@ fn validate_score_transform(st: &ScoreTransformJson) -> Result<(), String> {
 }
 
 /// Parse a VMAF model from its JSON string — spec §3.3.
-pub fn load_model(json: &str) -> Result<VmafModel, String> {
-    let root: Root = serde_json::from_str(json).map_err(|e| e.to_string())?;
+pub fn load_model(json: &str) -> Result<VmafModel, LoadModelError> {
+    let root: Root = serde_json::from_str(json)?;
     let d = root.model_dict;
 
     if d.slopes.len() < 7 {
-        return Err(format!(
-            "slopes must have ≥ 7 entries, got {}",
-            d.slopes.len()
-        ));
+        return Err(ModelValidationError::SlopesLen {
+            len: d.slopes.len(),
+        }
+        .into());
     }
     if d.intercepts.len() < 7 {
-        return Err(format!(
-            "intercepts must have ≥ 7 entries, got {}",
-            d.intercepts.len()
-        ));
+        return Err(ModelValidationError::InterceptsLen {
+            len: d.intercepts.len(),
+        }
+        .into());
     }
 
     if d.feature_names.len() != 6 {
-        return Err(format!(
-            "feature_names must have length 6, got {}",
-            d.feature_names.len()
-        ));
+        return Err(ModelValidationError::FeatureNamesLen {
+            len: d.feature_names.len(),
+        }
+        .into());
     }
-    let feature_names: [String; 6] = d.feature_names.clone().try_into().unwrap();
+    let feature_names: [String; 6] = d
+        .feature_names
+        .clone()
+        .try_into()
+        .map_err(|names: Vec<String>| ModelValidationError::FeatureNamesLen { len: names.len() })?;
     validate_feature_names(&feature_names)?;
 
     let mut adm_enhn_gain_limit = 100.0f64;
@@ -222,10 +231,10 @@ pub fn load_model(json: &str) -> Result<VmafModel, String> {
 
     if let Some(feature_opts_dicts) = d.feature_opts_dicts.as_ref() {
         if feature_opts_dicts.len() != 6 {
-            return Err(format!(
-                "feature_opts_dicts length must equal feature_names length (6), got {}",
-                feature_opts_dicts.len()
-            ));
+            return Err(ModelValidationError::FeatureOptsLen {
+                len: feature_opts_dicts.len(),
+            }
+            .into());
         }
 
         // Validate option value types (flat primitives only).
@@ -234,10 +243,12 @@ pub fn load_model(json: &str) -> Result<VmafModel, String> {
                 match v {
                     Value::Number(_) | Value::Bool(_) | Value::String(_) => {}
                     other => {
-                        return Err(format!(
-                            "feature_opts_dicts[{i}].{k} must be number/bool/string, got {}",
-                            json_type_name(other)
-                        ));
+                        return Err(ModelValidationError::FeatureOptionType {
+                            idx: i,
+                            key: k.clone(),
+                            found: json_type_name(other),
+                        }
+                        .into());
                     }
                 }
             }
@@ -258,14 +269,13 @@ pub fn load_model(json: &str) -> Result<VmafModel, String> {
 
         if vif_vals.iter().any(|v| v.is_some()) {
             if vif_vals.iter().any(|v| v.is_none()) {
-                return Err(
-                    "vif_enhn_gain_limit must be specified for all 4 VIF scale features"
-                        .to_string(),
-                );
+                return Err(ModelValidationError::MissingVifGainLimit.into());
             }
-            let first = vif_vals[0].unwrap();
-            if !vif_vals.iter().all(|v| v.unwrap() == first) {
-                return Err("vif_enhn_gain_limit must match across all VIF scales".to_string());
+            let [Some(first), Some(second), Some(third), Some(fourth)] = vif_vals else {
+                return Err(ModelValidationError::MissingVifGainLimit.into());
+            };
+            if second != first || third != first || fourth != first {
+                return Err(ModelValidationError::VifGainLimitMismatch.into());
             }
             vif_enhn_gain_limit = first;
         }
@@ -311,6 +321,7 @@ pub fn load_model(json: &str) -> Result<VmafModel, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{LoadModelError, ModelValidationError};
 
     const MINIMAL_JSON: &str = r#"{
         "model_dict": {
@@ -384,10 +395,9 @@ mod tests {
         assert!((st.p0.unwrap() - 1.70674692).abs() < 1e-8);
         assert!(st.out_gte_in);
         assert!(!st.out_lte_in);
-        assert_eq!(
-            m.svm.support_vectors[0].values,
-            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
-        );
+        assert_eq!(m.svm.support_vectors[0].values, [
+            0.1, 0.2, 0.3, 0.4, 0.5, 0.6
+        ]);
     }
 
     #[test]
@@ -413,11 +423,6 @@ mod tests {
     #[test]
     fn load_model_rejects_feature_opts_length_mismatch() {
         let bad = MINIMAL_JSON.replace(
-            "\"feature_names\": [",
-            "\"feature_names\": [", // keep anchor
-        );
-        // insert feature_opts_dicts with wrong length (5)
-        let bad = bad.replace(
             "\"slopes\":",
             "\"feature_opts_dicts\": [{},{},{},{},{}],\n            \"slopes\":",
         );
@@ -455,8 +460,13 @@ mod tests {
     fn load_model_rejects_score_transform_knots_with_too_few_points() {
         let bad = with_score_transform_knots("[[0.0, 0.0]]");
         let err = load_model(&bad).err().unwrap();
+        assert!(matches!(
+            &err,
+            LoadModelError::Validation(ModelValidationError::TooFewScoreTransformKnots { len: 1 })
+        ));
         assert!(
-            err.contains("score_transform.knots must have at least 2 points"),
+            err.to_string()
+                .contains("score_transform.knots must have at least 2 points"),
             "got {err}"
         );
     }
@@ -465,8 +475,16 @@ mod tests {
     fn load_model_rejects_score_transform_knots_with_non_increasing_x() {
         let bad = with_score_transform_knots("[[0.0, 0.0], [0.0, 10.0]]");
         let err = load_model(&bad).err().unwrap();
+        assert!(matches!(
+            &err,
+            LoadModelError::Validation(ModelValidationError::NonIncreasingScoreTransformX {
+                idx: 0,
+                next_idx: 1
+            })
+        ));
         assert!(
-            err.contains("score_transform.knots x values must be strictly increasing"),
+            err.to_string()
+                .contains("score_transform.knots x values must be strictly increasing"),
             "got {err}"
         );
     }
@@ -475,8 +493,16 @@ mod tests {
     fn load_model_rejects_score_transform_knots_with_decreasing_y() {
         let bad = with_score_transform_knots("[[0.0, 0.0], [100.0, -1.0]]");
         let err = load_model(&bad).err().unwrap();
+        assert!(matches!(
+            &err,
+            LoadModelError::Validation(ModelValidationError::DecreasingScoreTransformY {
+                idx: 0,
+                next_idx: 1
+            })
+        ));
         assert!(
-            err.contains("score_transform.knots y values must be nondecreasing"),
+            err.to_string()
+                .contains("score_transform.knots y values must be nondecreasing"),
             "got {err}"
         );
     }
@@ -485,6 +511,16 @@ mod tests {
     fn load_model_rejects_reversed_score_clip_bounds() {
         let bad = with_score_clip("[100.0, 0.0]");
         let err = load_model(&bad).err().unwrap();
-        assert!(err.contains("score_clip lower bound"), "got {err}");
+        assert!(matches!(
+            &err,
+            LoadModelError::Validation(ModelValidationError::InvalidScoreClipBounds {
+                lower: 100.0,
+                upper: 0.0
+            })
+        ));
+        assert!(
+            err.to_string().contains("score_clip lower bound"),
+            "got {err}"
+        );
     }
 }

@@ -1,8 +1,10 @@
 [package]
-name    = "vmaf-vif"
+name = "vmaf-vif"
 version = "0.1.0"
 edition = "2021"
 
 # §4.2 Integer VIF — no external math deps (LUT-only)
 [dependencies]
+aligned-vec = { workspace = true }
 vmaf-cpu = { workspace = true }
+thiserror = { workspace = true }

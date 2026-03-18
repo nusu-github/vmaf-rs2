@@ -1,41 +1,30 @@
 //! VIF feature extractor — spec §4.2
 
-use crate::filter::{subsample_into, SubsampleWorkspace};
-use crate::stat::{vif_statistic_with_workspace, VifStatWorkspace};
-use std::{error::Error, fmt};
+use thiserror::Error;
 use vmaf_cpu::SimdBackend;
+
+use crate::{
+    filter::{SubsampleWorkspace, subsample_into},
+    stat::{VifStatWorkspace, vif_statistic_with_workspace},
+};
 
 const MIN_FRAME_DIMENSION: usize = 16;
 
 /// Errors produced by [`VifExtractor`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum VifError {
     /// Width or height is below the minimum required by the spec kernels.
+    #[error(
+        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+    )]
     InvalidDimensions { width: usize, height: usize },
     /// Bit depth is not supported by the integer pipeline.
+    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
     InvalidBitDepth { bpc: u8 },
     /// Width × height overflowed `usize`.
+    #[error("sample count overflow for dimensions {width}x{height}")]
     SampleCountOverflow { width: usize, height: usize },
 }
-
-impl fmt::Display for VifError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidDimensions { width, height } => write!(
-                f,
-                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-            ),
-            Self::InvalidBitDepth { bpc } => {
-                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
-            }
-            Self::SampleCountOverflow { width, height } => {
-                write!(f, "sample count overflow for dimensions {width}x{height}")
-            }
-        }
-    }
-}
-
-impl Error for VifError {}
 
 /// Per-frame VIF scores — 4 scales + combined.
 pub struct VifScores {
@@ -324,8 +313,9 @@ fn effective_backend(backend: SimdBackend) -> SimdBackend {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use vmaf_cpu::SimdBackend;
+
+    use super::*;
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)

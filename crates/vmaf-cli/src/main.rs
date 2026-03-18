@@ -1,12 +1,11 @@
 //! vmaf-cli — command-line interface for VMAF scoring
 
+use std::{io::Read, path::PathBuf, time::Instant};
+
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::fmt;
-use std::io::Read;
-use std::path::PathBuf;
-use std::time::Instant;
-use vmaf::{load_model, PoolMethod, VmafContext, VmafOptions};
+use thiserror::Error;
+use vmaf::{LoadModelError, PoolMethod, VmafContext, VmafError, VmafOptions, load_model};
 
 #[derive(Debug, Parser)]
 #[command(version, about = "VMAF video quality metric")]
@@ -59,133 +58,87 @@ struct StreamMetadata {
     colorspace_family: ColorspaceFamily,
 }
 
-#[derive(Debug)]
+type LumaPair = (Vec<u16>, Vec<u16>);
+
+#[derive(Debug, Error)]
 enum CliError {
+    #[error("{stream} stream dimensions must be at least 16x16, got {width}x{height}")]
     InvalidDimensions {
         stream: &'static str,
         width: usize,
         height: usize,
     },
+    #[error("{stream} stream bit depth must be 8, 10, or 12, got {bit_depth} ({colorspace})")]
     InvalidBitDepth {
         stream: &'static str,
         bit_depth: u8,
         colorspace: String,
     },
+    #[error("{stream} stream colorspace is unsupported: {colorspace}")]
     UnsupportedColorspace {
         stream: &'static str,
         colorspace: String,
     },
+    #[error("reference and distorted {field} must match, got {reference} vs {distorted}")]
     MetadataMismatch {
         field: &'static str,
         reference: String,
         distorted: String,
     },
+    #[error(
+        "reference and distorted colorspaces must be compatible, got {reference} vs {distorted}"
+    )]
     ColorspaceMismatch {
         reference: String,
         distorted: String,
     },
+    #[error("{stream} stream ended before the other stream after {paired_frames} paired frames")]
     AsymmetricEof {
         stream: &'static str,
         paired_frames: usize,
     },
+    #[error("reference and distorted inputs must contain at least one frame")]
     ZeroFrameInput,
+    #[error("failed to read {stream} frame: {source}")]
     StreamRead {
         stream: &'static str,
+        #[source]
         source: y4m::Error,
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 enum FrameProcessingError<E> {
-    Cli(CliError),
+    #[error(transparent)]
+    Cli(#[from] CliError),
+    #[error(transparent)]
     Callback(E),
 }
 
-impl fmt::Display for CliError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidDimensions {
-                stream,
-                width,
-                height,
-            } => write!(
-                f,
-                "{stream} stream dimensions must be at least 16x16, got {width}x{height}"
-            ),
-            Self::InvalidBitDepth {
-                stream,
-                bit_depth,
-                colorspace,
-            } => write!(
-                f,
-                "{stream} stream bit depth must be 8, 10, or 12, got {bit_depth} ({colorspace})"
-            ),
-            Self::UnsupportedColorspace { stream, colorspace } => {
-                write!(f, "{stream} stream colorspace is unsupported: {colorspace}")
-            }
-            Self::MetadataMismatch {
-                field,
-                reference,
-                distorted,
-            } => write!(
-                f,
-                "reference and distorted {field} must match, got {reference} vs {distorted}"
-            ),
-            Self::ColorspaceMismatch {
-                reference,
-                distorted,
-            } => write!(
-                f,
-                "reference and distorted colorspaces must be compatible, got {reference} vs {distorted}"
-            ),
-            Self::AsymmetricEof {
-                stream,
-                paired_frames,
-            } => write!(
-                f,
-                "{stream} stream ended before the other stream after {paired_frames} paired frames"
-            ),
-            Self::ZeroFrameInput => {
-                write!(f, "reference and distorted inputs must contain at least one frame")
-            }
-            Self::StreamRead { stream, source } => {
-                write!(f, "failed to read {stream} frame: {source}")
-            }
-        }
-    }
+#[derive(Debug, Error)]
+#[error("unknown pool method: {value}")]
+struct PoolMethodParseError {
+    value: String,
 }
 
-impl std::error::Error for CliError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::StreamRead { source, .. } => Some(source),
-            _ => None,
-        }
-    }
-}
-
-impl<E: fmt::Display> fmt::Display for FrameProcessingError<E> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cli(source) => source.fmt(f),
-            Self::Callback(source) => source.fmt(f),
-        }
-    }
-}
-
-impl<E: std::error::Error + 'static> std::error::Error for FrameProcessingError<E> {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Cli(source) => Some(source),
-            Self::Callback(source) => Some(source),
-        }
-    }
-}
-
-impl<E> From<CliError> for FrameProcessingError<E> {
-    fn from(source: CliError) -> Self {
-        Self::Cli(source)
-    }
+#[derive(Debug, Error)]
+enum MainError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Decoder(#[from] y4m::Error),
+    #[error(transparent)]
+    Model(#[from] LoadModelError),
+    #[error(transparent)]
+    PoolMethod(#[from] PoolMethodParseError),
+    #[error(transparent)]
+    Cli(#[from] CliError),
+    #[error(transparent)]
+    FrameProcessing(#[from] FrameProcessingError<VmafError>),
+    #[error(transparent)]
+    Vmaf(#[from] VmafError),
+    #[error(transparent)]
+    ThreadPool(#[from] rayon::ThreadPoolBuildError),
 }
 
 fn luma_to_u16(y_plane: &[u8], bpc: u8) -> Vec<u16> {
@@ -200,13 +153,15 @@ fn luma_to_u16(y_plane: &[u8], bpc: u8) -> Vec<u16> {
     }
 }
 
-fn parse_pool_method(s: &str) -> Result<PoolMethod, Box<dyn std::error::Error>> {
+fn parse_pool_method(s: &str) -> Result<PoolMethod, PoolMethodParseError> {
     match s {
         "mean" => Ok(PoolMethod::Mean),
         "harmonic_mean" => Ok(PoolMethod::HarmonicMean),
         "min" => Ok(PoolMethod::Min),
         "max" => Ok(PoolMethod::Max),
-        other => Err(format!("unknown pool method: {other}").into()),
+        other => Err(PoolMethodParseError {
+            value: other.to_string(),
+        }),
     }
 }
 
@@ -317,7 +272,7 @@ fn read_luma_pair<R1: Read, R2: Read>(
     dis_dec: &mut y4m::Decoder<R2>,
     bpc: u8,
     paired_frames: usize,
-) -> Result<Option<(Vec<u16>, Vec<u16>)>, CliError> {
+) -> Result<Option<LumaPair>, CliError> {
     let ref_frame = ref_dec.read_frame();
     let dis_frame = dis_dec.read_frame();
 
@@ -393,12 +348,8 @@ where
     let mut batch = Vec::with_capacity(batch_size);
     let mut frame_count = 0usize;
 
-    loop {
-        match read_luma_pair(ref_dec, dis_dec, bpc, frame_count + batch.len())? {
-            Some(pair) => batch.push(pair),
-            None => break,
-        }
-
+    while let Some(pair) = read_luma_pair(ref_dec, dis_dec, bpc, frame_count + batch.len())? {
+        batch.push(pair);
         if batch.len() >= batch_size {
             flush_batch(&mut batch, &mut frame_count, &mut on_batch)?;
         }
@@ -451,7 +402,7 @@ fn make_progress_bar() -> ProgressBar {
     pb
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), MainError> {
     let args = Args::parse();
 
     if !args.quiet {
@@ -459,7 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let json = std::fs::read_to_string(&args.model)?;
-    let model = load_model(&json).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let model = load_model(&json)?;
     let pool_method = parse_pool_method(&args.pool_method)?;
 
     let ref_file = std::fs::File::open(&args.reference)?;
@@ -475,8 +426,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
             .num_threads(args.threads)
-            .build_global()
-            .unwrap();
+            .build_global()?;
     }
 
     let mut ctx = VmafContext::new_with_options(
@@ -518,7 +468,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     ) {
         pb.finish_and_clear();
-        return Err(Box::new(err));
+        return Err(err.into());
     }
 
     ctx.flush()?;
@@ -537,9 +487,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use clap::CommandFactory;
     use std::io::Cursor;
+
+    use clap::CommandFactory;
+
+    use super::*;
 
     fn parse_args(extra: &[&str]) -> Args {
         let mut argv = vec![
@@ -562,8 +514,8 @@ mod tests {
     ) -> (usize, usize, usize) {
         let bytes_per_sample = colorspace.get_bytes_per_sample();
         let y_len = width * height * bytes_per_sample;
-        let c420_len = ((width + 1) / 2) * ((height + 1) / 2) * bytes_per_sample;
-        let c422_len = ((width + 1) / 2) * height * bytes_per_sample;
+        let c420_len = width.div_ceil(2) * height.div_ceil(2) * bytes_per_sample;
+        let c422_len = width.div_ceil(2) * height * bytes_per_sample;
 
         match colorspace_family(colorspace) {
             Some(ColorspaceFamily::Mono) => (y_len, 0, 0),

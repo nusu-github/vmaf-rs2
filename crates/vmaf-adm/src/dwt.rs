@@ -2,8 +2,10 @@
 
 use std::mem::MaybeUninit;
 
+use aligned_vec::AVec;
+use vmaf_cpu::{ConstAlign32, assume_init_slice, avec_uninit_32};
+
 use crate::math::reflect_index;
-use vmaf_cpu::{Align32, AlignedScratch};
 
 pub(crate) const FILTER_LO: [i32; 4] = [15826, 27411, 7345, -4240];
 pub(crate) const FILTER_HI: [i32; 4] = [-4240, -7345, 27411, -15826];
@@ -17,10 +19,7 @@ fn reserve_output<T>(buffer: &mut Vec<T>, len: usize) {
     }
 }
 
-#[inline]
-unsafe fn assume_init_slice<T>(slice: &[MaybeUninit<T>]) -> &[T] {
-    std::slice::from_raw_parts(slice.as_ptr().cast::<T>(), slice.len())
-}
+type UninitAlignedVec32<T> = AVec<MaybeUninit<T>, ConstAlign32>;
 
 /// Normalize `abs_x` (≥ 32768) to a 15-bit mantissa — spec §4.3.8.
 ///
@@ -146,8 +145,8 @@ impl Bands32Buffer {
 /// Reusable aligned temporaries for scale-0 DWT vertical filtering.
 #[derive(Debug)]
 pub(crate) struct Scale0DwtWorkspace {
-    tmplo: AlignedScratch<MaybeUninit<i16>, Align32>,
-    tmphi: AlignedScratch<MaybeUninit<i16>, Align32>,
+    tmplo: UninitAlignedVec32<i16>,
+    tmphi: UninitAlignedVec32<i16>,
 }
 
 impl Default for Scale0DwtWorkspace {
@@ -160,17 +159,17 @@ impl Scale0DwtWorkspace {
     pub(crate) fn new(width: usize, height: usize) -> Self {
         let len = height.div_ceil(2) * width;
         Self {
-            tmplo: AlignedScratch::uninit(len),
-            tmphi: AlignedScratch::uninit(len),
+            tmplo: avec_uninit_32(len),
+            tmphi: avec_uninit_32(len),
         }
     }
 
     pub(crate) fn prepare_len(&mut self, len: usize) {
         if self.tmplo.len() < len {
-            self.tmplo = AlignedScratch::uninit(len);
+            self.tmplo = avec_uninit_32(len);
         }
         if self.tmphi.len() < len {
-            self.tmphi = AlignedScratch::uninit(len);
+            self.tmphi = avec_uninit_32(len);
         }
     }
 
@@ -199,8 +198,8 @@ impl Scale0DwtWorkspace {
 /// Reusable aligned temporaries for scale 1–3 DWT vertical filtering.
 #[derive(Debug)]
 pub(crate) struct Scale123DwtWorkspace {
-    tmplo: AlignedScratch<MaybeUninit<i32>, Align32>,
-    tmphi: AlignedScratch<MaybeUninit<i32>, Align32>,
+    tmplo: UninitAlignedVec32<i32>,
+    tmphi: UninitAlignedVec32<i32>,
 }
 
 impl Default for Scale123DwtWorkspace {
@@ -213,17 +212,17 @@ impl Scale123DwtWorkspace {
     pub(crate) fn new(width: usize, height: usize) -> Self {
         let len = height.div_ceil(2) * width;
         Self {
-            tmplo: AlignedScratch::uninit(len),
-            tmphi: AlignedScratch::uninit(len),
+            tmplo: avec_uninit_32(len),
+            tmphi: avec_uninit_32(len),
         }
     }
 
     pub(crate) fn prepare_len(&mut self, len: usize) {
         if self.tmplo.len() < len {
-            self.tmplo = AlignedScratch::uninit(len);
+            self.tmplo = avec_uninit_32(len);
         }
         if self.tmphi.len() < len {
-            self.tmphi = AlignedScratch::uninit(len);
+            self.tmphi = avec_uninit_32(len);
         }
     }
 

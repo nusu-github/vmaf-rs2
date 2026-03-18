@@ -163,8 +163,9 @@ fn horizontal_row_scalar_append(
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
-    use super::BlurImpl;
     use vmaf_cpu::SimdBackend;
+
+    use super::BlurImpl;
 
     pub(super) fn select(_backend: SimdBackend) -> Option<BlurImpl> {
         None
@@ -179,11 +180,12 @@ mod x86 {
     use std::arch::x86_64::*;
     use std::mem::MaybeUninit;
 
+    use vmaf_cpu::{SimdBackend, avec_assume_init, avec_uninit_32};
+
     use super::{
-        horizontal_pass_scalar, horizontal_row_scalar_append, reflect, vertical_pass_scalar_uninit,
-        vertical_pixel, BlurImpl, MOTION_FILTER,
+        BlurImpl, MOTION_FILTER, horizontal_pass_scalar, horizontal_row_scalar_append, reflect,
+        vertical_pass_scalar_uninit, vertical_pixel,
     };
-    use vmaf_cpu::{Align32, AlignedScratch, SimdBackend};
 
     pub(super) fn select(backend: SimdBackend) -> Option<BlurImpl> {
         match backend {
@@ -205,12 +207,12 @@ mod x86 {
         bpc: u8,
     ) -> Vec<u16> {
         let n = width * height;
-        let mut tmp = AlignedScratch::<MaybeUninit<u16>, Align32>::uninit(n);
+        let mut tmp = avec_uninit_32(n);
 
         // SAFETY: this wrapper is installed only after runtime SSE2 detection.
         unsafe { vertical_pass_sse2(src, stride, width, height, bpc, tmp.as_mut_slice()) };
         // SAFETY: `vertical_pass_sse2` fills every lane before returning.
-        let tmp = unsafe { tmp.assume_init() };
+        let tmp = unsafe { avec_assume_init(tmp) };
         horizontal_pass_scalar(tmp.as_slice(), width, height)
     }
 
@@ -222,12 +224,12 @@ mod x86 {
         bpc: u8,
     ) -> Vec<u16> {
         let n = width * height;
-        let mut tmp = AlignedScratch::<MaybeUninit<u16>, Align32>::uninit(n);
+        let mut tmp = avec_uninit_32(n);
 
         // SAFETY: this wrapper is installed only after runtime AVX2 detection.
         unsafe { vertical_pass_avx2(src, stride, width, height, bpc, tmp.as_mut_slice()) };
         // SAFETY: `vertical_pass_avx2` fills every lane before returning.
-        let tmp = unsafe { tmp.assume_init() };
+        let tmp = unsafe { avec_assume_init(tmp) };
         // SAFETY: this wrapper is installed only after runtime AVX2 detection.
         unsafe { horizontal_pass_avx2(tmp.as_slice(), width, height) }
     }

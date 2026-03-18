@@ -1,42 +1,31 @@
 //! ADM feature extractor — spec §4.3
 
-use crate::dwt::{Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace};
-use crate::score::{score_scale0, score_scale_s123};
-use crate::simd;
-use std::{error::Error, fmt};
+use thiserror::Error;
 use vmaf_cpu::SimdBackend;
+
+use crate::{
+    dwt::{Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace},
+    score::{score_scale_s123, score_scale0},
+    simd,
+};
 
 const MIN_FRAME_DIMENSION: usize = 16;
 
 /// Errors produced by [`AdmExtractor`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum AdmError {
     /// Width or height is below the minimum required by the spec kernels.
+    #[error(
+        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+    )]
     InvalidDimensions { width: usize, height: usize },
     /// Bit depth is not supported by the integer pipeline.
+    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
     InvalidBitDepth { bpc: u8 },
     /// Width × height overflowed `usize`.
+    #[error("sample count overflow for dimensions {width}x{height}")]
     SampleCountOverflow { width: usize, height: usize },
 }
-
-impl fmt::Display for AdmError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidDimensions { width, height } => write!(
-                f,
-                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-            ),
-            Self::InvalidBitDepth { bpc } => {
-                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
-            }
-            Self::SampleCountOverflow { width, height } => {
-                write!(f, "sample count overflow for dimensions {width}x{height}")
-            }
-        }
-    }
-}
-
-impl Error for AdmError {}
 
 /// Reusable internal buffers for per-frame ADM extraction.
 #[doc(hidden)]
@@ -239,11 +228,7 @@ impl AdmExtractor {
         } else {
             den_total as f64
         };
-        if den_d == 0.0 {
-            1.0
-        } else {
-            num_d / den_d
-        }
+        if den_d == 0.0 { 1.0 } else { num_d / den_d }
     }
 
     /// Compute the `adm2` score for one frame pair — spec §4.3.
@@ -270,8 +255,9 @@ fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), A
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use vmaf_cpu::SimdBackend;
+
+    use super::*;
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)

@@ -5,8 +5,8 @@
 //! caller-owned workspaces today.
 
 use crate::dwt::{
-    dwt_s123_into as scalar_dwt_s123_into, dwt_scale0_into as scalar_dwt_scale0_into,
     Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace,
+    dwt_s123_into as scalar_dwt_s123_into, dwt_scale0_into as scalar_dwt_scale0_into,
 };
 
 pub(crate) fn dwt_scale0_into(

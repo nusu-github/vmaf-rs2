@@ -1,12 +1,21 @@
-use std::alloc::{alloc, alloc_zeroed, dealloc, handle_alloc_error, Layout};
-use std::fmt;
-use std::marker::PhantomData;
-use std::mem::{align_of, size_of, ManuallyDrop, MaybeUninit};
-use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
-use std::slice;
+use std::{
+    alloc::handle_alloc_error,
+    fmt,
+    marker::PhantomData,
+    mem::{MaybeUninit, align_of},
+    ops::{Deref, DerefMut},
+};
 
+use aligned_vec::{AVec, RuntimeAlign, TryReserveError};
 use bytemuck::Zeroable;
+use thiserror::Error;
+
+/// Compile-time `16`-byte alignment for [`AVec`].
+pub type ConstAlign16 = aligned_vec::ConstAlign<16>;
+/// Compile-time `32`-byte alignment for [`AVec`].
+pub type ConstAlign32 = aligned_vec::ConstAlign<32>;
+/// Compile-time `64`-byte alignment for [`AVec`].
+pub type ConstAlign64 = aligned_vec::ConstAlign<64>;
 
 mod sealed {
     pub trait Sealed {}
@@ -14,9 +23,8 @@ mod sealed {
 
 /// Marker trait for explicit storage alignments owned by VMAF.
 ///
-/// Use [`AlignedBlock`] and [`AlignedScratch`] when the project controls the
-/// allocation and wants to guarantee a known alignment boundary for future SIMD
-/// kernels.
+/// Use [`AlignedBlock`] for fixed-size storage and [`AlignedScratch`] for
+/// callers that still want a stable, alignment-parametrized scratch wrapper.
 pub trait Alignment: Copy + Default + fmt::Debug + 'static + sealed::Sealed {
     /// Requested alignment in bytes.
     const BYTES: usize;
@@ -73,16 +81,6 @@ impl<T, A: Alignment> AlignedBlock<T, A> {
         &mut self.value
     }
 
-    /// Returns an immutable reference to the wrapped value.
-    pub fn as_ref(&self) -> &T {
-        &self.value
-    }
-
-    /// Returns a mutable reference to the wrapped value.
-    pub fn as_mut(&mut self) -> &mut T {
-        &mut self.value
-    }
-
     /// Consumes the block and returns the wrapped value.
     pub fn into_inner(self) -> T {
         self.value
@@ -121,12 +119,14 @@ impl<T, A: Alignment> DerefMut for AlignedBlock<T, A> {
     }
 }
 
-/// Errors that can occur while creating an [`AlignedScratch`] buffer.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Errors that can occur while creating aligned buffers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum AlignedAllocError {
-    /// The requested allocation would overflow `Layout` bounds.
+    /// The requested allocation would overflow buffer layout bounds.
+    #[error("aligned allocation layout overflow")]
     LayoutOverflow,
-    /// The allocator returned a null pointer for the requested layout.
+    /// The allocator failed for the requested buffer layout.
+    #[error("aligned allocation failed for {size} bytes with {align}-byte alignment")]
     AllocationFailed {
         /// Requested allocation size in bytes.
         size: usize,
@@ -135,42 +135,151 @@ pub enum AlignedAllocError {
     },
 }
 
-impl fmt::Display for AlignedAllocError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::LayoutOverflow => f.write_str("aligned allocation layout overflow"),
-            Self::AllocationFailed { size, align } => {
-                write!(
-                    f,
-                    "aligned allocation failed for {size} bytes with {align}-byte alignment"
-                )
-            }
+fn map_try_reserve_error(error: TryReserveError) -> AlignedAllocError {
+    match error {
+        TryReserveError::CapacityOverflow => AlignedAllocError::LayoutOverflow,
+        TryReserveError::AllocError { layout } => AlignedAllocError::AllocationFailed {
+            size: layout.size(),
+            align: layout.align(),
+        },
+    }
+}
+
+fn allocation_layout_error(len: usize) -> ! {
+    panic!("aligned scratch layout overflow for {len} elements")
+}
+
+fn abort_allocation(error: AlignedAllocError, len: usize) -> ! {
+    match error {
+        AlignedAllocError::LayoutOverflow => allocation_layout_error(len),
+        AlignedAllocError::AllocationFailed { size, align } => {
+            let layout = std::alloc::Layout::from_size_align(size, align)
+                .expect("saved allocation layout is valid");
+            handle_alloc_error(layout);
         }
     }
 }
 
-impl std::error::Error for AlignedAllocError {}
+fn try_runtime_uninit_vec<T>(
+    len: usize,
+    alignment: usize,
+) -> Result<AVec<MaybeUninit<T>, RuntimeAlign>, AlignedAllocError> {
+    let mut values = AVec::<MaybeUninit<T>, RuntimeAlign>::new(alignment);
+    values
+        .try_reserve_exact(len)
+        .map_err(map_try_reserve_error)?;
+    // SAFETY: capacity was reserved for `len` elements.
+    unsafe {
+        values.set_len(len);
+    }
+    Ok(values)
+}
+
+/// Allocates a zeroed aligned vector.
+pub fn try_avec_zeroed<T: Zeroable, const ALIGN: usize>(
+    len: usize,
+) -> Result<AVec<T, aligned_vec::ConstAlign<ALIGN>>, AlignedAllocError> {
+    let mut values = AVec::<MaybeUninit<T>, aligned_vec::ConstAlign<ALIGN>>::new(ALIGN);
+    values
+        .try_reserve_exact(len)
+        .map_err(map_try_reserve_error)?;
+    // SAFETY: capacity was reserved for `len` elements and all bytes are zeroed
+    // before the vector is converted into initialized storage.
+    unsafe {
+        values.set_len(len);
+        std::ptr::write_bytes(values.as_mut_ptr(), 0, len);
+        Ok(avec_assume_init(values))
+    }
+}
+
+/// Allocates a zeroed aligned vector or aborts on OOM.
+pub fn avec_zeroed<T: Zeroable, const ALIGN: usize>(
+    len: usize,
+) -> AVec<T, aligned_vec::ConstAlign<ALIGN>> {
+    match try_avec_zeroed::<T, ALIGN>(len) {
+        Ok(values) => values,
+        Err(error) => abort_allocation(error, len),
+    }
+}
+
+/// Allocates a zeroed `32`-byte aligned vector or aborts on OOM.
+pub fn avec_zeroed_32<T: Zeroable>(len: usize) -> AVec<T, ConstAlign32> {
+    avec_zeroed::<T, 32>(len)
+}
+
+/// Allocates a zeroed `64`-byte aligned vector or aborts on OOM.
+pub fn avec_zeroed_64<T: Zeroable>(len: usize) -> AVec<T, ConstAlign64> {
+    avec_zeroed::<T, 64>(len)
+}
+
+/// Allocates an uninitialized aligned vector.
+pub fn try_avec_uninit<T, const ALIGN: usize>(
+    len: usize,
+) -> Result<AVec<MaybeUninit<T>, aligned_vec::ConstAlign<ALIGN>>, AlignedAllocError> {
+    let mut values = AVec::<MaybeUninit<T>, aligned_vec::ConstAlign<ALIGN>>::new(ALIGN);
+    values
+        .try_reserve_exact(len)
+        .map_err(map_try_reserve_error)?;
+    // SAFETY: capacity was reserved for `len` elements, so setting the logical
+    // length is valid and exposes `MaybeUninit<T>` slots to the caller.
+    unsafe {
+        values.set_len(len);
+    }
+    Ok(values)
+}
+
+/// Allocates an uninitialized aligned vector or aborts on OOM.
+pub fn avec_uninit<T, const ALIGN: usize>(
+    len: usize,
+) -> AVec<MaybeUninit<T>, aligned_vec::ConstAlign<ALIGN>> {
+    match try_avec_uninit::<T, ALIGN>(len) {
+        Ok(values) => values,
+        Err(error) => abort_allocation(error, len),
+    }
+}
+
+/// Allocates an uninitialized `32`-byte aligned vector or aborts on OOM.
+pub fn avec_uninit_32<T>(len: usize) -> AVec<MaybeUninit<T>, ConstAlign32> {
+    avec_uninit::<T, 32>(len)
+}
+
+/// Allocates an uninitialized `64`-byte aligned vector or aborts on OOM.
+pub fn avec_uninit_64<T>(len: usize) -> AVec<MaybeUninit<T>, ConstAlign64> {
+    avec_uninit::<T, 64>(len)
+}
+
+/// Converts an uninitialized aligned vector into initialized storage.
+///
+/// # Safety
+///
+/// Every element in `values` must have been written with a valid `T`.
+pub unsafe fn avec_assume_init<T, A: aligned_vec::Alignment>(
+    values: AVec<MaybeUninit<T>, A>,
+) -> AVec<T, A> {
+    let (ptr, align, len, capacity) = values.into_raw_parts();
+    // SAFETY: the caller guarantees that each slot contains a valid `T`, and
+    // the raw parts originate from the `AVec<MaybeUninit<T>, A>` allocation.
+    unsafe { AVec::from_raw_parts(ptr.cast::<T>(), align, len, capacity) }
+}
+
+/// Reinterprets an initialized prefix of `MaybeUninit<T>` as `&[T]`.
+///
+/// # Safety
+///
+/// Every element in `slice` must already be initialized.
+pub unsafe fn assume_init_slice<T>(slice: &[MaybeUninit<T>]) -> &[T] {
+    // SAFETY: the caller guarantees every element has been initialized.
+    unsafe { std::slice::from_raw_parts(slice.as_ptr().cast::<T>(), slice.len()) }
+}
 
 /// Heap-backed scratch storage with an explicit alignment guarantee.
 ///
-/// This is intended for temporary buffers where VMAF owns the allocation and
-/// wants a stable alignment contract for later SIMD kernels.
+/// This remains as a compatibility wrapper, but its storage is now backed by
+/// [`AVec`] instead of a hand-rolled allocator.
 pub struct AlignedScratch<T, A: Alignment> {
-    ptr: NonNull<T>,
-    len: usize,
+    values: AVec<T, RuntimeAlign>,
     _align: PhantomData<A>,
 }
-
-// SAFETY: `AlignedScratch` uniquely owns its allocation and never shares mutable
-// access without `&mut self`. Moving the buffer to another thread only moves the
-// owned pointer/length pair, so this is sound whenever the stored elements can
-// themselves be transferred across threads.
-unsafe impl<T: Send, A: Alignment + Send> Send for AlignedScratch<T, A> {}
-
-// SAFETY: shared references only expose `&[T]`, and mutable access still
-// requires `&mut self`. The raw pointer is owned by the buffer, so concurrent
-// reads are sound whenever `T` is `Sync`.
-unsafe impl<T: Sync, A: Alignment + Sync> Sync for AlignedScratch<T, A> {}
 
 impl<T, A: Alignment> AlignedScratch<T, A> {
     /// Returns the effective alignment in bytes.
@@ -178,91 +287,62 @@ impl<T, A: Alignment> AlignedScratch<T, A> {
         align_of::<T>().max(A::BYTES)
     }
 
-    fn layout(len: usize) -> Result<Layout, AlignedAllocError> {
-        let size = size_of::<T>()
-            .checked_mul(len)
-            .ok_or(AlignedAllocError::LayoutOverflow)?;
-        Layout::from_size_align(size, Self::alignment())
-            .map_err(|_| AlignedAllocError::LayoutOverflow)
+    fn new(values: AVec<T, RuntimeAlign>) -> Self {
+        Self {
+            values,
+            _align: PhantomData,
+        }
     }
 
     /// Returns the number of elements in the buffer.
     pub fn len(&self) -> usize {
-        self.len
+        self.values.len()
     }
 
     /// Returns `true` when the buffer has no elements.
     pub fn is_empty(&self) -> bool {
-        self.len == 0
+        self.values.is_empty()
     }
 
     /// Returns a raw pointer to the first element.
     pub fn as_ptr(&self) -> *const T {
-        self.ptr.as_ptr()
+        self.values.as_ptr()
     }
 
     /// Returns a mutable raw pointer to the first element.
     pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.ptr.as_ptr()
+        self.values.as_mut_ptr()
     }
 
     /// Borrows the buffer as a slice.
     pub fn as_slice(&self) -> &[T] {
-        // SAFETY: `ptr` either comes from an allocation for `len` elements of `T`
-        // or is a dangling pointer used only for zero-sized/empty slices.
-        unsafe { slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+        self.values.as_slice()
     }
 
     /// Borrows the buffer as a mutable slice.
     pub fn as_mut_slice(&mut self) -> &mut [T] {
-        // SAFETY: same reasoning as `as_slice`, plus `&mut self` guarantees
-        // unique access to the allocation.
-        unsafe { slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+        self.values.as_mut_slice()
     }
 }
 
 impl<T: Zeroable, A: Alignment> AlignedScratch<T, A> {
     /// Allocates a zero-initialized aligned scratch buffer.
     pub fn try_zeroed(len: usize) -> Result<Self, AlignedAllocError> {
-        let layout = Self::layout(len)?;
-        if layout.size() == 0 {
-            return Ok(Self {
-                ptr: NonNull::dangling(),
-                len,
-                _align: PhantomData,
-            });
+        let alignment = Self::alignment();
+        let mut values = try_runtime_uninit_vec::<T>(len, alignment)?;
+        // SAFETY: the vector is fully allocated for `len` elements, and zeroed
+        // bytes are a valid representation because `T: Zeroable`.
+        unsafe {
+            std::ptr::write_bytes(values.as_mut_ptr(), 0, len);
+            Ok(Self::new(avec_assume_init(values)))
         }
-
-        // SAFETY: `layout` was validated above. `alloc_zeroed` returns a pointer
-        // suitable for deallocation with the same layout, and zeroed bytes are a
-        // valid representation because `T: Zeroable`.
-        let ptr = unsafe { alloc_zeroed(layout) };
-        let Some(ptr) = NonNull::new(ptr.cast::<T>()) else {
-            return Err(AlignedAllocError::AllocationFailed {
-                size: layout.size(),
-                align: layout.align(),
-            });
-        };
-
-        Ok(Self {
-            ptr,
-            len,
-            _align: PhantomData,
-        })
     }
 
     /// Allocates a zero-initialized aligned scratch buffer or aborts on OOM.
     pub fn zeroed(len: usize) -> Self {
         match Self::try_zeroed(len) {
             Ok(scratch) => scratch,
-            Err(AlignedAllocError::LayoutOverflow) => {
-                panic!("aligned scratch layout overflow for {len} elements")
-            }
-            Err(AlignedAllocError::AllocationFailed { size, align }) => {
-                let layout =
-                    Layout::from_size_align(size, align).expect("saved allocation layout is valid");
-                handle_alloc_error(layout);
-            }
+            Err(error) => abort_allocation(error, len),
         }
     }
 }
@@ -274,45 +354,17 @@ impl<T, A: Alignment> AlignedScratch<MaybeUninit<T>, A> {
     /// `&mut [MaybeUninit<T>]`. Call [`Self::assume_init`] only after every
     /// element has been fully initialized with a valid `T`.
     pub fn try_uninit(len: usize) -> Result<Self, AlignedAllocError> {
-        let layout = Self::layout(len)?;
-        if layout.size() == 0 {
-            return Ok(Self {
-                ptr: NonNull::dangling(),
-                len,
-                _align: PhantomData,
-            });
-        }
-
-        // SAFETY: `layout` was validated above. `alloc` returns a pointer
-        // suitable for deallocation with the same layout, and
-        // `MaybeUninit<T>` permits uninitialized bytes.
-        let ptr = unsafe { alloc(layout) };
-        let Some(ptr) = NonNull::new(ptr.cast::<MaybeUninit<T>>()) else {
-            return Err(AlignedAllocError::AllocationFailed {
-                size: layout.size(),
-                align: layout.align(),
-            });
-        };
-
-        Ok(Self {
-            ptr,
+        Ok(Self::new(try_runtime_uninit_vec::<T>(
             len,
-            _align: PhantomData,
-        })
+            Self::alignment(),
+        )?))
     }
 
     /// Allocates an uninitialized aligned scratch buffer or aborts on OOM.
     pub fn uninit(len: usize) -> Self {
         match Self::try_uninit(len) {
             Ok(scratch) => scratch,
-            Err(AlignedAllocError::LayoutOverflow) => {
-                panic!("aligned scratch layout overflow for {len} elements")
-            }
-            Err(AlignedAllocError::AllocationFailed { size, align }) => {
-                let layout =
-                    Layout::from_size_align(size, align).expect("saved allocation layout is valid");
-                handle_alloc_error(layout);
-            }
+            Err(error) => abort_allocation(error, len),
         }
     }
 
@@ -323,39 +375,15 @@ impl<T, A: Alignment> AlignedScratch<MaybeUninit<T>, A> {
     /// Every element in the buffer must have been written with a valid `T`
     /// before calling this function.
     pub unsafe fn assume_init(self) -> AlignedScratch<T, A> {
-        let scratch = ManuallyDrop::new(self);
-        AlignedScratch {
-            ptr: scratch.ptr.cast::<T>(),
-            len: scratch.len,
-            _align: PhantomData,
-        }
+        // SAFETY: the caller guarantees that every element is initialized.
+        let values = unsafe { avec_assume_init(self.values) };
+        AlignedScratch::new(values)
     }
 }
 
 impl<T: Zeroable, A: Alignment> Default for AlignedScratch<T, A> {
     fn default() -> Self {
         Self::zeroed(0)
-    }
-}
-
-impl<T, A: Alignment> Drop for AlignedScratch<T, A> {
-    fn drop(&mut self) {
-        // SAFETY: the allocation stores `len` initialized `T` elements.
-        unsafe {
-            std::ptr::drop_in_place(std::ptr::slice_from_raw_parts_mut(
-                self.ptr.as_ptr(),
-                self.len,
-            ))
-        };
-
-        let layout = Self::layout(self.len).expect("existing scratch buffer has a valid layout");
-        if layout.size() == 0 {
-            return;
-        }
-
-        // SAFETY: `ptr` was allocated with `alloc`/`alloc_zeroed` using this
-        // exact layout and has not been deallocated yet.
-        unsafe { dealloc(self.ptr.as_ptr().cast::<u8>(), layout) };
     }
 }
 
@@ -376,7 +404,7 @@ impl<T, A: Alignment> DerefMut for AlignedScratch<T, A> {
 impl<T: fmt::Debug, A: Alignment> fmt::Debug for AlignedScratch<T, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AlignedScratch")
-            .field("len", &self.len)
+            .field("len", &self.len())
             .field("alignment", &Self::alignment())
             .field("values", &self.as_slice())
             .finish()
@@ -394,6 +422,19 @@ mod tests {
         assert_eq!(AlignedBlock::<[u8; 8], Align32>::alignment(), 32);
         assert_eq!(block.as_ptr() as usize % 32, 0);
         assert_eq!(block.into_inner(), [0; 8]);
+    }
+
+    #[test]
+    fn avec_zeroed_honors_alignment() {
+        let mut values = avec_zeroed::<u16, 32>(19);
+
+        assert_eq!(values.alignment(), 32);
+        assert_eq!(values.len(), 19);
+        assert_eq!(values.as_ptr() as usize % 32, 0);
+        assert!(values.iter().all(|&value| value == 0));
+
+        values[3] = 7;
+        assert_eq!(values.as_slice()[3], 7);
     }
 
     #[test]

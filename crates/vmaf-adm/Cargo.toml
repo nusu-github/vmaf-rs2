@@ -1,9 +1,11 @@
 [package]
-name    = "vmaf-adm"
+name = "vmaf-adm"
 version = "0.1.0"
 edition = "2021"
 
 # §4.3 ADM — needs libm::cbrtf for score calculation (§4.3.9)
 [dependencies]
+aligned-vec = { workspace = true }
 libm = { workspace = true }
+thiserror = { workspace = true }
 vmaf-cpu = { workspace = true }

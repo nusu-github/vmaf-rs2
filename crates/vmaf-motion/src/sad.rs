@@ -68,8 +68,9 @@ pub(crate) fn compute_sad_scalar_reference(
 
 #[cfg(target_arch = "aarch64")]
 mod aarch64 {
-    use super::SadImpl;
     use vmaf_cpu::SimdBackend;
+
+    use super::SadImpl;
 
     pub(super) fn select(_backend: SimdBackend) -> Option<SadImpl> {
         None
@@ -83,8 +84,9 @@ mod x86 {
     #[cfg(target_arch = "x86_64")]
     use std::arch::x86_64::*;
 
-    use super::{normalize_sad, SadImpl};
     use vmaf_cpu::SimdBackend;
+
+    use super::{SadImpl, normalize_sad};
 
     const AVX2_LANES: usize = 16;
     const SSE2_LANES: usize = 8;

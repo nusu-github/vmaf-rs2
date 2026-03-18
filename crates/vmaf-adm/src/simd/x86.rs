@@ -1,14 +1,17 @@
-use crate::dwt::{
-    dwt_s123_horizontal_scalar_at, dwt_scale0_horizontal_scalar_at, Bands16Buffer, Bands32Buffer,
-    Scale0DwtWorkspace, Scale123DwtWorkspace, DWT_LO_SUM, FILTER_HI, FILTER_LO, SCALE_PARAMS,
-};
-use crate::math::reflect_index;
-use std::mem::MaybeUninit;
-
 #[cfg(target_arch = "x86")]
 use std::arch::x86::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::mem::MaybeUninit;
+
+use crate::{
+    dwt::{
+        Bands16Buffer, Bands32Buffer, DWT_LO_SUM, FILTER_HI, FILTER_LO, SCALE_PARAMS,
+        Scale0DwtWorkspace, Scale123DwtWorkspace, dwt_s123_horizontal_scalar_at,
+        dwt_scale0_horizontal_scalar_at,
+    },
+    math::reflect_index,
+};
 
 #[inline]
 fn scale0_params(bpc: u8) -> (u32, i32) {

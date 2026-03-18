@@ -1,8 +1,12 @@
 //! Gaussian subsampling: low-pass filter + 2:1 decimate — spec §4.2.5
 
-use crate::math::reflect_index;
-use crate::tables::{FILTER, FILTER_WIDTH};
-use vmaf_cpu::{Align32, AlignedScratch, SimdBackend};
+use aligned_vec::AVec;
+use vmaf_cpu::{ConstAlign32, SimdBackend, avec_zeroed_32};
+
+use crate::{
+    math::reflect_index,
+    tables::{FILTER, FILTER_WIDTH},
+};
 
 mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -12,13 +16,15 @@ const FILTER_TAP_CAP: usize = 18;
 const HORIZONTAL_SHIFT: u32 = 16;
 const HORIZONTAL_ROUND: u32 = 32768;
 
+type AlignedVec32<T> = AVec<T, ConstAlign32>;
+
 /// Reusable aligned buffers for one subsampling step.
 #[derive(Debug)]
 pub(crate) struct SubsampleWorkspace {
-    tmp_ref: AlignedScratch<u16, Align32>,
-    tmp_dis: AlignedScratch<u16, Align32>,
-    filt_ref: AlignedScratch<u16, Align32>,
-    filt_dis: AlignedScratch<u16, Align32>,
+    tmp_ref: AlignedVec32<u16>,
+    tmp_dis: AlignedVec32<u16>,
+    filt_ref: AlignedVec32<u16>,
+    filt_dis: AlignedVec32<u16>,
 }
 
 impl Default for SubsampleWorkspace {
@@ -30,25 +36,25 @@ impl Default for SubsampleWorkspace {
 impl SubsampleWorkspace {
     pub(crate) fn new(max_frame_len: usize) -> Self {
         Self {
-            tmp_ref: AlignedScratch::zeroed(max_frame_len),
-            tmp_dis: AlignedScratch::zeroed(max_frame_len),
-            filt_ref: AlignedScratch::zeroed(max_frame_len),
-            filt_dis: AlignedScratch::zeroed(max_frame_len),
+            tmp_ref: avec_zeroed_32(max_frame_len),
+            tmp_dis: avec_zeroed_32(max_frame_len),
+            filt_ref: avec_zeroed_32(max_frame_len),
+            filt_dis: avec_zeroed_32(max_frame_len),
         }
     }
 
     fn prepare(&mut self, frame_len: usize) {
         if self.tmp_ref.len() < frame_len {
-            self.tmp_ref = AlignedScratch::zeroed(frame_len);
+            self.tmp_ref = avec_zeroed_32(frame_len);
         }
         if self.tmp_dis.len() < frame_len {
-            self.tmp_dis = AlignedScratch::zeroed(frame_len);
+            self.tmp_dis = avec_zeroed_32(frame_len);
         }
         if self.filt_ref.len() < frame_len {
-            self.filt_ref = AlignedScratch::zeroed(frame_len);
+            self.filt_ref = avec_zeroed_32(frame_len);
         }
         if self.filt_dis.len() < frame_len {
-            self.filt_dis = AlignedScratch::zeroed(frame_len);
+            self.filt_dis = avec_zeroed_32(frame_len);
         }
     }
 }
@@ -295,8 +301,9 @@ fn decimate_filtered_into(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use vmaf_cpu::SimdBackend;
+
+    use super::*;
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)

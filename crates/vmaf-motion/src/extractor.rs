@@ -1,62 +1,39 @@
 //! MotionExtractor: ring-buffer state machine — spec §4.4.2
 
-use crate::blur::blur_frame_with_backend;
-use crate::sad::compute_sad_with_backend;
-use crate::simd;
-use std::{error::Error, fmt};
+use thiserror::Error;
 use vmaf_cpu::SimdBackend;
+
+use crate::{blur::blur_frame_with_backend, sad::compute_sad_with_backend, simd};
 
 const MIN_FRAME_DIMENSION: usize = 16;
 
 /// Errors produced by [`MotionExtractor`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MotionError {
     /// Width or height is below the minimum required by the spec kernels.
+    #[error(
+        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
+    )]
     InvalidDimensions { width: usize, height: usize },
     /// Bit depth is not supported by the integer pipeline.
+    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
     InvalidBitDepth { bpc: u8 },
     /// Width × height or stride × height overflowed `usize`.
+    #[error("sample count overflow for dimensions {width}x{height}")]
     SampleCountOverflow { width: usize, height: usize },
     /// The extractor has already been flushed and is now terminal.
+    #[error("motion extractor has already been flushed")]
     AlreadyFlushed,
     /// The provided stride is smaller than the configured frame width.
+    #[error("invalid stride {stride}: expected at least width {width}")]
     InvalidStride { stride: usize, width: usize },
     /// The provided input plane is too short for the configured stride and height.
+    #[error("invalid plane length {actual}: expected at least {required} samples")]
     InvalidPlaneLength { actual: usize, required: usize },
     /// A pre-blurred plane did not match the configured frame area.
+    #[error("invalid blurred plane length {actual}: expected exactly {required} samples")]
     InvalidBlurredPlaneLength { actual: usize, required: usize },
 }
-
-impl fmt::Display for MotionError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidDimensions { width, height } => write!(
-                f,
-                "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-            ),
-            Self::InvalidBitDepth { bpc } => {
-                write!(f, "invalid bit depth {bpc}: expected one of 8, 10, or 12")
-            }
-            Self::SampleCountOverflow { width, height } => {
-                write!(f, "sample count overflow for dimensions {width}x{height}")
-            }
-            Self::AlreadyFlushed => write!(f, "motion extractor has already been flushed"),
-            Self::InvalidStride { stride, width } => {
-                write!(f, "invalid stride {stride}: expected at least width {width}")
-            }
-            Self::InvalidPlaneLength { actual, required } => write!(
-                f,
-                "invalid plane length {actual}: expected at least {required} samples"
-            ),
-            Self::InvalidBlurredPlaneLength { actual, required } => write!(
-                f,
-                "invalid blurred plane length {actual}: expected exactly {required} samples"
-            ),
-        }
-    }
-}
-
-impl Error for MotionError {}
 
 /// Stateful motion extractor for a single video sequence.
 ///

@@ -14,10 +14,13 @@ mod extractor;
 
 #[cfg(test)]
 mod tests {
-    use super::blur::{blur_frame, blur_frame_scalar_reference, blur_frame_with_backend};
-    use super::sad::{compute_sad, compute_sad_scalar_reference, compute_sad_with_backend};
-    use super::{MotionError, MotionExtractor};
     use vmaf_cpu::SimdBackend;
+
+    use super::{
+        MotionError, MotionExtractor,
+        blur::{blur_frame, blur_frame_scalar_reference, blur_frame_with_backend},
+        sad::{compute_sad, compute_sad_scalar_reference, compute_sad_with_backend},
+    };
 
     fn patterned_frame(width: usize, height: usize, stride: usize, modulo: usize) -> Vec<u16> {
         let mut frame = vec![u16::MAX; stride * height];

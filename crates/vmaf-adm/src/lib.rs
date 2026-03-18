@@ -17,16 +17,19 @@ pub use extractor::{AdmError, AdmExtractor, AdmWorkspace};
 
 #[cfg(test)]
 mod tests {
-    use super::decouple::decouple_scale0;
-    use super::dwt::{dwt_s123, dwt_scale0, get_best15_from32};
-    use super::extractor::AdmExtractor;
-    use super::math::reflect_index;
-    use super::score::{
-        score_scale0, score_scale0_reference, score_scale_s123, score_scale_s123_reference,
-    };
-    use super::simd;
-    use super::tables::DIV_LOOKUP;
     use vmaf_cpu::SimdBackend;
+
+    use super::{
+        decouple::decouple_scale0,
+        dwt::{dwt_s123, dwt_scale0, get_best15_from32},
+        extractor::AdmExtractor,
+        math::reflect_index,
+        score::{
+            score_scale_s123, score_scale_s123_reference, score_scale0, score_scale0_reference,
+        },
+        simd,
+        tables::DIV_LOOKUP,
+    };
 
     // ── div_lookup §8 conformance ─────────────────────────────────────────────
 
