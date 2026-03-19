@@ -2,6 +2,7 @@
 #![deny(unsafe_code)]
 
 use std::{
+    cell::RefCell,
     collections::VecDeque,
     ops::AddAssign,
     time::{Duration, Instant},
@@ -20,6 +21,78 @@ use vmaf_model::{
 use vmaf_motion::{Collecting as MotionCollecting, MotionError, MotionExtractor};
 use vmaf_vif::{VifExtractor, VifWorkspace};
 const MIN_PARALLEL_JOB_LEN: usize = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GeometryKey {
+    width: usize,
+    height: usize,
+    bpc: u8,
+}
+
+impl GeometryKey {
+    fn new(geometry: &FrameGeometry) -> Self {
+        Self {
+            width: geometry.width(),
+            height: geometry.height(),
+            bpc: geometry.bpc(),
+        }
+    }
+}
+
+struct BatchWorkerScratch {
+    key: GeometryKey,
+    vif: VifWorkspace,
+    adm: AdmWorkspace,
+}
+
+impl BatchWorkerScratch {
+    fn new(vif: &VifExtractor, adm: &AdmExtractor, key: GeometryKey) -> Self {
+        Self {
+            key,
+            vif: vif.make_workspace(),
+            adm: adm.make_workspace(),
+        }
+    }
+}
+
+std::thread_local! {
+    static BATCH_WORKER_SCRATCH: RefCell<Option<BatchWorkerScratch>> = const { RefCell::new(None) };
+}
+
+struct BatchWorkerScratchLease {
+    scratch: Option<BatchWorkerScratch>,
+}
+
+impl BatchWorkerScratchLease {
+    fn acquire(vif: &VifExtractor, adm: &AdmExtractor, key: GeometryKey) -> Self {
+        let scratch = BATCH_WORKER_SCRATCH.with(|cell| {
+            let maybe_scratch = cell.borrow_mut().take();
+            match maybe_scratch {
+                Some(scratch) if scratch.key == key => scratch,
+                _ => BatchWorkerScratch::new(vif, adm, key),
+            }
+        });
+        Self {
+            scratch: Some(scratch),
+        }
+    }
+
+    fn scratch_mut(&mut self) -> &mut BatchWorkerScratch {
+        self.scratch
+            .as_mut()
+            .expect("worker scratch should exist while the lease is alive")
+    }
+}
+
+impl Drop for BatchWorkerScratchLease {
+    fn drop(&mut self) {
+        if let Some(scratch) = self.scratch.take() {
+            BATCH_WORKER_SCRATCH.with(|cell| {
+                *cell.borrow_mut() = Some(scratch);
+            });
+        }
+    }
+}
 
 /// Errors produced by [`VmafContext`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -276,6 +349,7 @@ impl VmafContext<Collecting> {
         let adm = &self.adm;
         let motion = &self.state.motion;
         let stride = self.geometry.width();
+        let geometry_key = GeometryKey::new(&self.geometry);
         let processing_start = Instant::now();
         let feature_start = Instant::now();
         let min_job_len = frames
@@ -286,10 +360,11 @@ impl VmafContext<Collecting> {
             .par_iter()
             .with_min_len(min_job_len)
             .map_init(
-                || (vif.make_workspace(), adm.make_workspace()),
-                |(vif_workspace, adm_workspace), (r, d)| {
-                    let vif_scores = vif.compute_frame_with_workspace(vif_workspace, r, d);
-                    let adm_score = adm.compute_frame_with_workspace(adm_workspace, r, d);
+                || BatchWorkerScratchLease::acquire(vif, adm, geometry_key),
+                |lease, (r, d)| {
+                    let scratch = lease.scratch_mut();
+                    let vif_scores = vif.compute_frame_with_workspace(&mut scratch.vif, r, d);
+                    let adm_score = adm.compute_frame_with_workspace(&mut scratch.adm, r, d);
                     let blur = motion.prepare_blurred_frame(r, stride);
                     (vif_scores, adm_score, blur)
                 },

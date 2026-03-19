@@ -23,7 +23,7 @@ mod tests {
         filter::subsample,
         math::{log2_32, log2_64, reflect_index},
         stat::vif_statistic,
-        tables::LOG2_TABLE,
+        tables::{LOG2_TABLE, LOG2_TABLE_MIN_INDEX},
     };
 
     fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
@@ -67,9 +67,9 @@ mod tests {
 
     #[test]
     fn log2_table_reference_vectors() {
-        assert_eq!(LOG2_TABLE[32768], 30720);
-        assert_eq!(LOG2_TABLE[49152], 31918);
-        assert_eq!(LOG2_TABLE[65535], 32768);
+        assert_eq!(LOG2_TABLE[32768 - LOG2_TABLE_MIN_INDEX], 30720);
+        assert_eq!(LOG2_TABLE[49152 - LOG2_TABLE_MIN_INDEX], 31918);
+        assert_eq!(LOG2_TABLE[65535 - LOG2_TABLE_MIN_INDEX], 32768);
     }
 
     // ── reflect_index ─────────────────────────────────────────────────────────

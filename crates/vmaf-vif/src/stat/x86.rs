@@ -673,42 +673,26 @@ unsafe fn horizontal_row_avx2<const TAPS: usize>(
         _mm256_storeu_si256(sigma12_even_values.as_mut_ptr().cast(), sigma12_even);
         _mm256_storeu_si256(sigma12_odd_values.as_mut_ptr().cast(), sigma12_odd);
         match vif_gain_limit_mode {
-            VifGainLimitMode::Unit => {
-                for pair in 0..4 {
-                    process_sigma_values_with_limit(
-                        sigma1_even_values[pair],
-                        sigma2_even_values[pair],
-                        sigma12_even_values[pair],
-                        1.0,
-                        accum,
-                    );
-                    process_sigma_values_with_limit(
-                        sigma1_odd_values[pair],
-                        sigma2_odd_values[pair],
-                        sigma12_odd_values[pair],
-                        1.0,
-                        accum,
-                    );
-                }
-            }
-            VifGainLimitMode::Generic(limit) => {
-                for pair in 0..4 {
-                    process_sigma_values_with_limit(
-                        sigma1_even_values[pair],
-                        sigma2_even_values[pair],
-                        sigma12_even_values[pair],
-                        limit,
-                        accum,
-                    );
-                    process_sigma_values_with_limit(
-                        sigma1_odd_values[pair],
-                        sigma2_odd_values[pair],
-                        sigma12_odd_values[pair],
-                        limit,
-                        accum,
-                    );
-                }
-            }
+            VifGainLimitMode::Unit => process_sigma_pair_block_with_limit(
+                &sigma1_even_values,
+                &sigma2_even_values,
+                &sigma12_even_values,
+                &sigma1_odd_values,
+                &sigma2_odd_values,
+                &sigma12_odd_values,
+                1.0,
+                accum,
+            ),
+            VifGainLimitMode::Generic(limit) => process_sigma_pair_block_with_limit(
+                &sigma1_even_values,
+                &sigma2_even_values,
+                &sigma12_even_values,
+                &sigma1_odd_values,
+                &sigma2_odd_values,
+                &sigma12_odd_values,
+                limit,
+                accum,
+            ),
         }
     }
 
@@ -733,6 +717,35 @@ unsafe fn mul_u16x4_to_u32(values: *const u16, coeff: __m128i) -> __m128i {
     let low = _mm_mullo_epi16(packed, coeff);
     let high = _mm_mulhi_epu16(packed, coeff);
     _mm_unpacklo_epi16(low, high)
+}
+
+#[inline(always)]
+fn process_sigma_pair_block_with_limit(
+    sigma1_even_values: &[i64; 4],
+    sigma2_even_values: &[i64; 4],
+    sigma12_even_values: &[i64; 4],
+    sigma1_odd_values: &[i64; 4],
+    sigma2_odd_values: &[i64; 4],
+    sigma12_odd_values: &[i64; 4],
+    vif_enhn_gain_limit: f64,
+    accum: &mut RunningStatAccumulators,
+) {
+    for pair in 0..4 {
+        process_sigma_values_with_limit(
+            sigma1_even_values[pair],
+            sigma2_even_values[pair],
+            sigma12_even_values[pair],
+            vif_enhn_gain_limit,
+            accum,
+        );
+        process_sigma_values_with_limit(
+            sigma1_odd_values[pair],
+            sigma2_odd_values[pair],
+            sigma12_odd_values[pair],
+            vif_enhn_gain_limit,
+            accum,
+        );
+    }
 }
 
 #[target_feature(enable = "avx2")]

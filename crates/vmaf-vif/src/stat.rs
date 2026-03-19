@@ -442,32 +442,53 @@ fn horizontal_scalar_range(
 ) {
     let width = tmp_mu1.len();
 
-    for j in start..end {
-        let mut acc_mu1 = 0u32;
-        let mut acc_mu2 = 0u32;
-        let mut acc_ref = 0u64;
-        let mut acc_dis = 0u64;
-        let mut acc_rdi = 0u64;
+    match vif_gain_limit_mode {
+        VifGainLimitMode::Unit => {
+            for j in start..end {
+                let mut acc_mu1 = 0u32;
+                let mut acc_mu2 = 0u32;
+                let mut acc_ref = 0u64;
+                let mut acc_dis = 0u64;
+                let mut acc_rdi = 0u64;
 
-        for (tap, &coeff) in coeffs.iter().enumerate() {
-            let jj = reflect_index(j as i32 - half as i32 + tap as i32, width as i32);
-            let c = coeff as u32;
-            acc_mu1 += c * tmp_mu1[jj] as u32;
-            acc_mu2 += c * tmp_mu2[jj] as u32;
-            acc_ref += c as u64 * tmp_ref_sq[jj] as u64;
-            acc_dis += c as u64 * tmp_dis_sq[jj] as u64;
-            acc_rdi += c as u64 * tmp_ref_dis[jj] as u64;
+                for (tap, &coeff) in coeffs.iter().enumerate() {
+                    let jj = reflect_index(j as i32 - half as i32 + tap as i32, width as i32);
+                    let c = coeff as u32;
+                    acc_mu1 += c * tmp_mu1[jj] as u32;
+                    acc_mu2 += c * tmp_mu2[jj] as u32;
+                    acc_ref += c as u64 * tmp_ref_sq[jj] as u64;
+                    acc_dis += c as u64 * tmp_dis_sq[jj] as u64;
+                    acc_rdi += c as u64 * tmp_ref_dis[jj] as u64;
+                }
+
+                process_filtered_pixel_with_limit(
+                    acc_mu1, acc_mu2, acc_ref, acc_dis, acc_rdi, 1.0, accum,
+                );
+            }
         }
+        VifGainLimitMode::Generic(limit) => {
+            for j in start..end {
+                let mut acc_mu1 = 0u32;
+                let mut acc_mu2 = 0u32;
+                let mut acc_ref = 0u64;
+                let mut acc_dis = 0u64;
+                let mut acc_rdi = 0u64;
 
-        process_filtered_pixel(
-            acc_mu1,
-            acc_mu2,
-            acc_ref,
-            acc_dis,
-            acc_rdi,
-            vif_gain_limit_mode,
-            accum,
-        );
+                for (tap, &coeff) in coeffs.iter().enumerate() {
+                    let jj = reflect_index(j as i32 - half as i32 + tap as i32, width as i32);
+                    let c = coeff as u32;
+                    acc_mu1 += c * tmp_mu1[jj] as u32;
+                    acc_mu2 += c * tmp_mu2[jj] as u32;
+                    acc_ref += c as u64 * tmp_ref_sq[jj] as u64;
+                    acc_dis += c as u64 * tmp_dis_sq[jj] as u64;
+                    acc_rdi += c as u64 * tmp_ref_dis[jj] as u64;
+                }
+
+                process_filtered_pixel_with_limit(
+                    acc_mu1, acc_mu2, acc_ref, acc_dis, acc_rdi, limit, accum,
+                );
+            }
+        }
     }
 }
 
@@ -494,6 +515,26 @@ fn process_filtered_pixel(
     vif_gain_limit_mode: VifGainLimitMode,
     accum: &mut RunningStatAccumulators,
 ) {
+    match vif_gain_limit_mode {
+        VifGainLimitMode::Unit => process_filtered_pixel_with_limit(
+            acc_mu1, acc_mu2, acc_ref, acc_dis, acc_rdi, 1.0, accum,
+        ),
+        VifGainLimitMode::Generic(limit) => process_filtered_pixel_with_limit(
+            acc_mu1, acc_mu2, acc_ref, acc_dis, acc_rdi, limit, accum,
+        ),
+    }
+}
+
+#[inline]
+fn process_filtered_pixel_with_limit(
+    acc_mu1: u32,
+    acc_mu2: u32,
+    acc_ref: u64,
+    acc_dis: u64,
+    acc_rdi: u64,
+    vif_enhn_gain_limit: f64,
+    accum: &mut RunningStatAccumulators,
+) {
     let mu1_sq = ((acc_mu1 as u64 * acc_mu1 as u64 + 2147483648) >> 32) as u32;
     let mu2_sq = ((acc_mu2 as u64 * acc_mu2 as u64 + 2147483648) >> 32) as u32;
     let mu1_mu2 = ((acc_mu1 as u64 * acc_mu2 as u64 + 2147483648) >> 32) as u32;
@@ -506,24 +547,27 @@ fn process_filtered_pixel(
     let sigma2_sq = (dis_filt as i64 - mu2_sq as i64).max(0);
     let sigma12 = rdi_filt as i64 - mu1_mu2 as i64;
 
-    process_sigma_values(sigma1_sq, sigma2_sq, sigma12, vif_gain_limit_mode, accum);
+    process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, vif_enhn_gain_limit, accum);
 }
 
+#[cfg(test)]
 #[inline]
-fn process_sigma_values(
-    sigma1_sq: i64,
-    sigma2_sq: i64,
-    sigma12: i64,
-    vif_gain_limit_mode: VifGainLimitMode,
+fn process_sigma_row_with_limit(
+    sigma1_row: &[i64],
+    sigma2_row: &[i64],
+    sigma12_row: &[i64],
+    vif_enhn_gain_limit: f64,
     accum: &mut RunningStatAccumulators,
 ) {
-    match vif_gain_limit_mode {
-        VifGainLimitMode::Unit => {
-            process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, 1.0, accum);
-        }
-        VifGainLimitMode::Generic(limit) => {
-            process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, limit, accum);
-        }
+    debug_assert_eq!(sigma1_row.len(), sigma2_row.len());
+    debug_assert_eq!(sigma1_row.len(), sigma12_row.len());
+
+    for ((&sigma1_sq, &sigma2_sq), &sigma12) in sigma1_row
+        .iter()
+        .zip(sigma2_row.iter())
+        .zip(sigma12_row.iter())
+    {
+        process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, vif_enhn_gain_limit, accum);
     }
 }
 
@@ -536,27 +580,12 @@ fn process_sigma_row(
     vif_gain_limit_mode: VifGainLimitMode,
     accum: &mut RunningStatAccumulators,
 ) {
-    debug_assert_eq!(sigma1_row.len(), sigma2_row.len());
-    debug_assert_eq!(sigma1_row.len(), sigma12_row.len());
-
     match vif_gain_limit_mode {
         VifGainLimitMode::Unit => {
-            for ((&sigma1_sq, &sigma2_sq), &sigma12) in sigma1_row
-                .iter()
-                .zip(sigma2_row.iter())
-                .zip(sigma12_row.iter())
-            {
-                process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, 1.0, accum);
-            }
+            process_sigma_row_with_limit(sigma1_row, sigma2_row, sigma12_row, 1.0, accum);
         }
         VifGainLimitMode::Generic(limit) => {
-            for ((&sigma1_sq, &sigma2_sq), &sigma12) in sigma1_row
-                .iter()
-                .zip(sigma2_row.iter())
-                .zip(sigma12_row.iter())
-            {
-                process_sigma_values_with_limit(sigma1_sq, sigma2_sq, sigma12, limit, accum);
-            }
+            process_sigma_row_with_limit(sigma1_row, sigma2_row, sigma12_row, limit, accum);
         }
     }
 }
