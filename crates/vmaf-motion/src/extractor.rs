@@ -1,26 +1,16 @@
 //! MotionExtractor: ring-buffer state machine — spec §4.4.2
 
 use thiserror::Error;
-use vmaf_cpu::SimdBackend;
+use vmaf_cpu::{FrameValidationError, SimdBackend, checked_sample_count, validate_frame_geometry};
 
 use crate::{blur::blur_frame_with_backend, sad::compute_sad_with_backend, simd};
-
-const MIN_FRAME_DIMENSION: usize = 16;
 
 /// Errors produced by [`MotionExtractor`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MotionError {
-    /// Width or height is below the minimum required by the spec kernels.
-    #[error(
-        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-    )]
-    InvalidDimensions { width: usize, height: usize },
-    /// Bit depth is not supported by the integer pipeline.
-    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
-    InvalidBitDepth { bpc: u8 },
-    /// Width × height or stride × height overflowed `usize`.
-    #[error("sample count overflow for dimensions {width}x{height}")]
-    SampleCountOverflow { width: usize, height: usize },
+    /// Shared frame-geometry validation errors.
+    #[error(transparent)]
+    FrameValidation(#[from] FrameValidationError),
     /// The extractor has already been flushed and is now terminal.
     #[error("motion extractor has already been flushed")]
     AlreadyFlushed,
@@ -69,7 +59,7 @@ impl MotionExtractor {
     /// Returns [`MotionError`] when dimensions are below the spec minimum, the
     /// bit depth is unsupported, or the frame area overflows `usize`.
     pub fn new(width: usize, height: usize, bpc: u8) -> Result<Self, MotionError> {
-        Self::with_backend(width, height, bpc, simd::select_backend())
+        Self::with_backend(width, height, bpc, simd::default_backend())
     }
 
     #[cfg(test)]
@@ -93,7 +83,7 @@ impl MotionExtractor {
             width,
             height,
             bpc,
-            backend: simd::effective_backend(backend),
+            backend: backend.effective(),
             slots: [Vec::new(), Vec::new(), Vec::new()],
             frame_count: 0,
             motion1_prev: 0.0,
@@ -231,12 +221,7 @@ impl MotionExtractor {
             });
         }
 
-        let required = checked_sample_count(stride, self.height).map_err(|_| {
-            MotionError::SampleCountOverflow {
-                width: stride,
-                height: self.height,
-            }
-        })?;
+        let required = checked_sample_count(stride, self.height).map_err(MotionError::from)?;
         if luma.len() < required {
             return Err(MotionError::InvalidPlaneLength {
                 actual: luma.len(),
@@ -256,21 +241,4 @@ impl MotionExtractor {
         }
         Ok(())
     }
-}
-
-fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), MotionError> {
-    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
-        return Err(MotionError::InvalidDimensions { width, height });
-    }
-    if !matches!(bpc, 8 | 10 | 12) {
-        return Err(MotionError::InvalidBitDepth { bpc });
-    }
-    checked_sample_count(width, height)?;
-    Ok(())
-}
-
-fn checked_sample_count(width: usize, height: usize) -> Result<usize, MotionError> {
-    width
-        .checked_mul(height)
-        .ok_or(MotionError::SampleCountOverflow { width, height })
 }

@@ -45,7 +45,7 @@ pub(crate) fn blur_frame_with_backend(
     height: usize,
     bpc: u8,
 ) -> Vec<u16> {
-    select_impl(crate::simd::effective_backend(backend))(src, stride, width, height, bpc)
+    select_impl(backend.effective())(src, stride, width, height, bpc)
 }
 
 fn select_impl(backend: SimdBackend) -> BlurImpl {

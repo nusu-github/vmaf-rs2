@@ -395,9 +395,10 @@ mod tests {
         assert!((st.p0.unwrap() - 1.70674692).abs() < 1e-8);
         assert!(st.out_gte_in);
         assert!(!st.out_lte_in);
-        assert_eq!(m.svm.support_vectors[0].values, [
-            0.1, 0.2, 0.3, 0.4, 0.5, 0.6
-        ]);
+        assert_eq!(
+            m.svm.support_vectors[0].values,
+            [0.1, 0.2, 0.3, 0.4, 0.5, 0.6]
+        );
     }
 
     #[test]

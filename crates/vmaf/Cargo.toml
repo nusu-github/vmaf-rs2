@@ -9,5 +9,6 @@ vmaf-vif = { workspace = true }
 vmaf-adm = { workspace = true }
 vmaf-motion = { workspace = true }
 vmaf-model = { workspace = true }
+vmaf-cpu = { workspace = true }
 rayon = { workspace = true }
 thiserror = { workspace = true }

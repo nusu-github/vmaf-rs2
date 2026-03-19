@@ -1,18 +1,6 @@
 //! Math primitives for Integer VIF (spec §4.1.1, §4.2.2, §4.2.3)
 
-/// Reflective (mirror) padding index — spec §4.1.1.
-///
-/// Precondition: `w >= 2`.
-#[inline]
-pub(crate) const fn reflect_index(i: i32, w: i32) -> usize {
-    if i < 0 {
-        (-i) as usize
-    } else if i >= w {
-        (2 * w - 2 - i) as usize
-    } else {
-        i as usize
-    }
-}
+pub(crate) use vmaf_cpu::reflect_index;
 
 /// Q11 log2 from a 32-bit value using the precomputed LUT — spec §4.2.2.
 ///

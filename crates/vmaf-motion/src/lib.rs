@@ -14,6 +14,7 @@ mod extractor;
 
 #[cfg(test)]
 mod tests {
+    use vmaf_cpu::FrameValidationError;
     use vmaf_cpu::SimdBackend;
 
     use super::{
@@ -269,21 +270,27 @@ mod tests {
     fn motion_rejects_invalid_dimensions_and_bpc() {
         assert!(matches!(
             MotionExtractor::new(15, 16, 8),
-            Err(MotionError::InvalidDimensions {
-                width: 15,
-                height: 16
-            })
+            Err(MotionError::FrameValidation(
+                FrameValidationError::InvalidDimensions {
+                    width: 15,
+                    height: 16,
+                }
+            ))
         ));
         assert!(matches!(
             MotionExtractor::new(16, 15, 8),
-            Err(MotionError::InvalidDimensions {
-                width: 16,
-                height: 15
-            })
+            Err(MotionError::FrameValidation(
+                FrameValidationError::InvalidDimensions {
+                    width: 16,
+                    height: 15,
+                }
+            ))
         ));
         assert!(matches!(
             MotionExtractor::new(16, 16, 9),
-            Err(MotionError::InvalidBitDepth { bpc: 9 })
+            Err(MotionError::FrameValidation(
+                FrameValidationError::InvalidBitDepth { bpc: 9 }
+            ))
         ));
     }
 

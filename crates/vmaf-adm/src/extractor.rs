@@ -1,7 +1,6 @@
 //! ADM feature extractor — spec §4.3
 
-use thiserror::Error;
-use vmaf_cpu::SimdBackend;
+use vmaf_cpu::{FrameValidationError, SimdBackend, validate_frame_geometry};
 
 use crate::{
     dwt::{Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace},
@@ -9,23 +8,8 @@ use crate::{
     simd,
 };
 
-const MIN_FRAME_DIMENSION: usize = 16;
-
 /// Errors produced by [`AdmExtractor`].
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum AdmError {
-    /// Width or height is below the minimum required by the spec kernels.
-    #[error(
-        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-    )]
-    InvalidDimensions { width: usize, height: usize },
-    /// Bit depth is not supported by the integer pipeline.
-    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
-    InvalidBitDepth { bpc: u8 },
-    /// Width × height overflowed `usize`.
-    #[error("sample count overflow for dimensions {width}x{height}")]
-    SampleCountOverflow { width: usize, height: usize },
-}
+pub type AdmError = FrameValidationError;
 
 /// Reusable internal buffers for per-frame ADM extraction.
 #[doc(hidden)]
@@ -97,7 +81,7 @@ impl AdmExtractor {
             height,
             bpc,
             adm_enhn_gain_limit,
-            simd::select_backend(),
+            SimdBackend::detect_effective(),
         )
     }
 
@@ -125,7 +109,7 @@ impl AdmExtractor {
             height,
             bpc,
             adm_enhn_gain_limit,
-            backend: simd::effective_backend(backend),
+            backend: backend.effective(),
         })
     }
 
@@ -246,19 +230,6 @@ impl AdmExtractor {
         let mut workspace = self.make_workspace();
         self.compute_frame_with_workspace(&mut workspace, ref_plane, dis_plane)
     }
-}
-
-fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), AdmError> {
-    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
-        return Err(AdmError::InvalidDimensions { width, height });
-    }
-    if !matches!(bpc, 8 | 10 | 12) {
-        return Err(AdmError::InvalidBitDepth { bpc });
-    }
-    width
-        .checked_mul(height)
-        .ok_or(AdmError::SampleCountOverflow { width, height })?;
-    Ok(())
 }
 
 #[cfg(test)]

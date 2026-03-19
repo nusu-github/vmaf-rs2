@@ -8,7 +8,8 @@ use std::{
 };
 
 use thiserror::Error;
-use vmaf_adm::{AdmError, AdmExtractor, AdmWorkspace};
+use vmaf_adm::{AdmExtractor, AdmWorkspace};
+use vmaf_cpu::{FrameValidationError, MIN_FRAME_DIMENSION, validate_frame_geometry};
 pub use vmaf_model::{
     LibsvmParseError, LoadModelError, ModelValidationError, PoolMethod, VmafModel, load_model,
 };
@@ -16,9 +17,7 @@ use vmaf_model::{
     collect_scores, denormalize, normalize_features, pool, score_transform, svm_predict,
 };
 use vmaf_motion::{MotionError, MotionExtractor};
-use vmaf_vif::{VifError, VifExtractor, VifWorkspace};
-
-const MIN_FRAME_DIMENSION: usize = 16;
+use vmaf_vif::{VifExtractor, VifWorkspace};
 const MIN_PARALLEL_JOB_LEN: usize = 2;
 
 /// Errors produced by [`VmafContext`].
@@ -49,28 +48,14 @@ pub enum VmafError {
     Motion(MotionError),
 }
 
-impl From<VifError> for VmafError {
-    fn from(err: VifError) -> Self {
+impl From<FrameValidationError> for VmafError {
+    fn from(err: FrameValidationError) -> Self {
         match err {
-            VifError::InvalidDimensions { width, height } => {
+            FrameValidationError::InvalidDimensions { width, height } => {
                 Self::InvalidDimensions { width, height }
             }
-            VifError::InvalidBitDepth { bpc } => Self::InvalidBitDepth { bpc },
-            VifError::SampleCountOverflow { width, height } => {
-                Self::SampleCountOverflow { width, height }
-            }
-        }
-    }
-}
-
-impl From<AdmError> for VmafError {
-    fn from(err: AdmError) -> Self {
-        match err {
-            AdmError::InvalidDimensions { width, height } => {
-                Self::InvalidDimensions { width, height }
-            }
-            AdmError::InvalidBitDepth { bpc } => Self::InvalidBitDepth { bpc },
-            AdmError::SampleCountOverflow { width, height } => {
+            FrameValidationError::InvalidBitDepth { bpc } => Self::InvalidBitDepth { bpc },
+            FrameValidationError::SampleCountOverflow { width, height } => {
                 Self::SampleCountOverflow { width, height }
             }
         }
@@ -80,13 +65,7 @@ impl From<AdmError> for VmafError {
 impl From<MotionError> for VmafError {
     fn from(err: MotionError) -> Self {
         match err {
-            MotionError::InvalidDimensions { width, height } => {
-                Self::InvalidDimensions { width, height }
-            }
-            MotionError::InvalidBitDepth { bpc } => Self::InvalidBitDepth { bpc },
-            MotionError::SampleCountOverflow { width, height } => {
-                Self::SampleCountOverflow { width, height }
-            }
+            MotionError::FrameValidation(err) => err.into(),
             MotionError::AlreadyFlushed => Self::AlreadyFlushed,
             MotionError::InvalidPlaneLength { actual, required }
             | MotionError::InvalidBlurredPlaneLength { actual, required } => {
@@ -497,19 +476,6 @@ impl VmafContext {
         }
         Ok(())
     }
-}
-
-fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), VmafError> {
-    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
-        return Err(VmafError::InvalidDimensions { width, height });
-    }
-    if !matches!(bpc, 8 | 10 | 12) {
-        return Err(VmafError::InvalidBitDepth { bpc });
-    }
-    width
-        .checked_mul(height)
-        .ok_or(VmafError::SampleCountOverflow { width, height })?;
-    Ok(())
 }
 
 #[cfg(test)]

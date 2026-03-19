@@ -436,6 +436,7 @@ dependencies = [
  "rayon",
  "thiserror",
  "vmaf-adm",
+ "vmaf-cpu",
  "vmaf-model",
  "vmaf-motion",
  "vmaf-vif",
@@ -447,7 +448,6 @@ version = "0.1.0"
 dependencies = [
  "aligned-vec",
  "libm",
- "thiserror",
  "vmaf-cpu",
 ]
 
@@ -497,7 +497,6 @@ name = "vmaf-vif"
 version = "0.1.0"
 dependencies = [
  "aligned-vec",
- "thiserror",
  "vmaf-cpu",
 ]
 

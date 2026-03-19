@@ -1,30 +1,14 @@
 //! VIF feature extractor — spec §4.2
 
-use thiserror::Error;
-use vmaf_cpu::SimdBackend;
+use vmaf_cpu::{FrameValidationError, SimdBackend, validate_frame_geometry};
 
 use crate::{
     filter::{SubsampleWorkspace, subsample_into},
     stat::{VifGainLimitMode, VifStatWorkspace, vif_statistic_with_workspace_mode},
 };
 
-const MIN_FRAME_DIMENSION: usize = 16;
-
 /// Errors produced by [`VifExtractor`].
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum VifError {
-    /// Width or height is below the minimum required by the spec kernels.
-    #[error(
-        "invalid frame dimensions {width}x{height}: width and height must be at least {MIN_FRAME_DIMENSION}"
-    )]
-    InvalidDimensions { width: usize, height: usize },
-    /// Bit depth is not supported by the integer pipeline.
-    #[error("invalid bit depth {bpc}: expected one of 8, 10, or 12")]
-    InvalidBitDepth { bpc: u8 },
-    /// Width × height overflowed `usize`.
-    #[error("sample count overflow for dimensions {width}x{height}")]
-    SampleCountOverflow { width: usize, height: usize },
-}
+pub type VifError = FrameValidationError;
 
 /// Per-frame VIF scores — 4 scales + combined.
 pub struct VifScores {
@@ -97,7 +81,7 @@ impl VifExtractor {
             height,
             bpc,
             vif_enhn_gain_limit,
-            SimdBackend::detect(),
+            SimdBackend::detect_effective(),
         )
     }
 
@@ -114,7 +98,7 @@ impl VifExtractor {
             height,
             bpc,
             vif_gain_limit_mode: VifGainLimitMode::new(vif_enhn_gain_limit),
-            backend: effective_backend(backend),
+            backend: backend.effective(),
         })
     }
 
@@ -276,38 +260,6 @@ impl VifExtractor {
     pub fn compute_frame(&self, ref_plane: &[u16], dis_plane: &[u16]) -> VifScores {
         let mut workspace = self.make_workspace();
         self.compute_frame_with_workspace(&mut workspace, ref_plane, dis_plane)
-    }
-}
-
-fn validate_frame_geometry(width: usize, height: usize, bpc: u8) -> Result<(), VifError> {
-    if width < MIN_FRAME_DIMENSION || height < MIN_FRAME_DIMENSION {
-        return Err(VifError::InvalidDimensions { width, height });
-    }
-    if !matches!(bpc, 8 | 10 | 12) {
-        return Err(VifError::InvalidBitDepth { bpc });
-    }
-    width
-        .checked_mul(height)
-        .ok_or(VifError::SampleCountOverflow { width, height })?;
-    Ok(())
-}
-
-fn effective_backend(backend: SimdBackend) -> SimdBackend {
-    if !backend.is_available() {
-        return SimdBackend::Scalar;
-    }
-
-    match backend {
-        SimdBackend::X86Avx512 => {
-            if SimdBackend::X86Avx2Fma.is_available() {
-                SimdBackend::X86Avx2Fma
-            } else if SimdBackend::X86Sse2.is_available() {
-                SimdBackend::X86Sse2
-            } else {
-                SimdBackend::Scalar
-            }
-        }
-        other => other,
     }
 }
 

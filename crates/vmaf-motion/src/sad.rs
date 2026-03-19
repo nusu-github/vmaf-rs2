@@ -26,7 +26,7 @@ pub(crate) fn compute_sad_with_backend(
     width: usize,
     height: usize,
 ) -> f32 {
-    select_impl(crate::simd::effective_backend(backend))(buf_a, buf_b, width, height)
+    select_impl(backend.effective())(buf_a, buf_b, width, height)
 }
 
 fn select_impl(backend: SimdBackend) -> SadImpl {

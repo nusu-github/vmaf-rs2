@@ -22,9 +22,39 @@ impl SimdBackend {
         probe::best_available_backend()
     }
 
+    /// Detects the best backend supported by both the current process and the
+    /// kernels implemented in this workspace.
+    pub fn detect_effective() -> Self {
+        Self::detect().effective()
+    }
+
     /// Returns `true` when this backend is supported by the current process.
     pub fn is_available(self) -> bool {
         probe::backend_available(self)
+    }
+
+    /// Resolves a requested backend to the best kernel backend actually usable
+    /// by this workspace on the current process.
+    ///
+    /// This keeps backend fallback policy in one place instead of duplicating
+    /// AVX-512 → AVX2/SSE2/scalar handling across feature crates.
+    pub fn effective(self) -> Self {
+        if !self.is_available() {
+            return Self::Scalar;
+        }
+
+        match self {
+            Self::X86Avx512 => {
+                if Self::X86Avx2Fma.is_available() {
+                    Self::X86Avx2Fma
+                } else if Self::X86Sse2.is_available() {
+                    Self::X86Sse2
+                } else {
+                    Self::Scalar
+                }
+            }
+            other => other,
+        }
     }
 
     /// Returns a short, stable backend name for diagnostics.
@@ -55,6 +85,12 @@ mod tests {
         assert!(detected.is_available());
     }
 
+    #[test]
+    fn detected_effective_backend_is_available() {
+        let detected = SimdBackend::detect_effective();
+        assert!(detected.is_available());
+    }
+
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     #[test]
     fn x86_detection_never_reports_aarch64_backend() {
@@ -71,6 +107,27 @@ mod tests {
         assert!(SimdBackend::X86Sse2.is_available());
     }
 
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn x86_avx512_request_falls_back_to_supported_kernel_backend() {
+        let resolved = SimdBackend::X86Avx512.effective();
+
+        if SimdBackend::X86Avx512.is_available() {
+            assert!(matches!(
+                resolved,
+                SimdBackend::X86Avx2Fma | SimdBackend::X86Sse2
+            ));
+        } else {
+            assert_eq!(resolved, SimdBackend::Scalar);
+        }
+    }
+
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    #[test]
+    fn unavailable_cross_arch_backend_falls_back_to_scalar() {
+        assert_eq!(SimdBackend::Aarch64Neon.effective(), SimdBackend::Scalar);
+    }
+
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn aarch64_detection_never_reports_x86_backend() {
@@ -80,5 +137,11 @@ mod tests {
             detected,
             SimdBackend::X86Sse2 | SimdBackend::X86Avx2Fma | SimdBackend::X86Avx512
         ));
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn unavailable_cross_arch_backend_falls_back_to_scalar() {
+        assert_eq!(SimdBackend::X86Sse2.effective(), SimdBackend::Scalar);
     }
 }

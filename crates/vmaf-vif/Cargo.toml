@@ -7,4 +7,3 @@ edition = "2021"
 [dependencies]
 aligned-vec = { workspace = true }
 vmaf-cpu = { workspace = true }
-thiserror = { workspace = true }

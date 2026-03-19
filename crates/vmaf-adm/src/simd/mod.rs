@@ -10,29 +10,6 @@ mod aarch64;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 mod x86;
 
-pub(crate) fn select_backend() -> SimdBackend {
-    effective_backend(SimdBackend::detect())
-}
-
-pub(crate) fn effective_backend(backend: SimdBackend) -> SimdBackend {
-    if !backend.is_available() {
-        return SimdBackend::Scalar;
-    }
-
-    match backend {
-        SimdBackend::X86Avx512 => {
-            if SimdBackend::X86Avx2Fma.is_available() {
-                SimdBackend::X86Avx2Fma
-            } else if SimdBackend::X86Sse2.is_available() {
-                SimdBackend::X86Sse2
-            } else {
-                SimdBackend::Scalar
-            }
-        }
-        other => other,
-    }
-}
-
 pub(crate) fn dwt_scale0(
     backend: SimdBackend,
     src: &[u16],
@@ -55,7 +32,7 @@ pub(crate) fn dwt_scale0_into(
     workspace: &mut Scale0DwtWorkspace,
     bands: &mut Bands16Buffer,
 ) {
-    match effective_backend(backend) {
+    match backend.effective() {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         SimdBackend::X86Avx2Fma => {
             x86::dwt_scale0_avx2_into(src, width, height, bpc, workspace, bands)
@@ -102,7 +79,7 @@ pub(crate) fn dwt_s123_into(
     workspace: &mut Scale123DwtWorkspace,
     bands: &mut Bands32Buffer,
 ) {
-    match effective_backend(backend) {
+    match backend.effective() {
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         SimdBackend::X86Avx2Fma => {
             x86::dwt_s123_avx2_into(ll, width, height, scale, workspace, bands)
