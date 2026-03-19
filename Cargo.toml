@@ -39,3 +39,9 @@ vmaf-cpu = { path = "crates/vmaf-cpu" }
 [profile.release]
 lto = true
 codegen-units = 1
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+lto = false
+codegen-units = 16
