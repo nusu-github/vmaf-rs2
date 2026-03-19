@@ -1,5 +1,7 @@
 //! Core data structures — spec §3.3, §5
 
+use vmaf_cpu::GainLimit;
+
 /// One support vector with its dual coefficient.
 pub struct SupportVector {
     pub coef: f64,
@@ -46,7 +48,7 @@ pub struct VmafModel {
     pub score_transform: Option<ScoreTransform>,
 
     /// ADM enhancement gain limit (default 100.0) — spec §3.3 / §4.3.
-    pub adm_enhn_gain_limit: f64,
+    pub adm_enhn_gain_limit: GainLimit,
     /// VIF enhancement gain clamp (default 100.0) — spec §3.3 / §4.2.
-    pub vif_enhn_gain_limit: f64,
+    pub vif_enhn_gain_limit: GainLimit,
 }

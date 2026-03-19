@@ -1,6 +1,7 @@
 //! Score pooling — spec §5.5
 
 /// Pooling method.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolMethod {
     Mean,
     HarmonicMean,

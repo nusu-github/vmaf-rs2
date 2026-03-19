@@ -1,14 +1,11 @@
 //! VIF feature extractor — spec §4.2
 
-use vmaf_cpu::{FrameValidationError, SimdBackend, validate_frame_geometry};
+use vmaf_cpu::{FrameGeometry, GainLimit, SimdBackend};
 
 use crate::{
     filter::{SubsampleWorkspace, subsample_into},
     stat::{VifGainLimitMode, VifStatWorkspace, vif_statistic_with_workspace_mode},
 };
-
-/// Errors produced by [`VifExtractor`].
-pub type VifError = FrameValidationError;
 
 /// Per-frame VIF scores — 4 scales + combined.
 pub struct VifScores {
@@ -56,55 +53,36 @@ enum CurrentScaleLevel {
 /// The extractor auto-selects the best available SIMD backend at construction
 /// time while preserving the existing public API.
 pub struct VifExtractor {
-    width: usize,
-    height: usize,
-    bpc: u8,
+    geometry: FrameGeometry,
     vif_gain_limit_mode: VifGainLimitMode,
     backend: SimdBackend,
 }
 
 impl VifExtractor {
     /// Create a VIF extractor for one frame geometry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VifError`] when dimensions are below the spec minimum, the
-    /// bit depth is unsupported, or the frame area overflows `usize`.
-    pub fn new(
-        width: usize,
-        height: usize,
-        bpc: u8,
-        vif_enhn_gain_limit: f64,
-    ) -> Result<Self, VifError> {
+    pub fn new(geometry: FrameGeometry, vif_enhn_gain_limit: GainLimit) -> Self {
         Self::with_backend(
-            width,
-            height,
-            bpc,
+            geometry,
             vif_enhn_gain_limit,
             SimdBackend::detect_effective(),
         )
     }
 
     pub(crate) fn with_backend(
-        width: usize,
-        height: usize,
-        bpc: u8,
-        vif_enhn_gain_limit: f64,
+        geometry: FrameGeometry,
+        vif_enhn_gain_limit: GainLimit,
         backend: SimdBackend,
-    ) -> Result<Self, VifError> {
-        validate_frame_geometry(width, height, bpc)?;
-        Ok(Self {
-            width,
-            height,
-            bpc,
-            vif_gain_limit_mode: VifGainLimitMode::new(vif_enhn_gain_limit),
+    ) -> Self {
+        Self {
+            geometry,
+            vif_gain_limit_mode: VifGainLimitMode::from_gain_limit(vif_enhn_gain_limit),
             backend: backend.effective(),
-        })
+        }
     }
 
     #[doc(hidden)]
     pub fn make_workspace(&self) -> VifWorkspace {
-        VifWorkspace::new(self.width, self.height)
+        VifWorkspace::new(self.geometry.width(), self.geometry.height())
     }
 
     #[doc(hidden)]
@@ -114,7 +92,8 @@ impl VifExtractor {
         ref_plane: &[u16],
         dis_plane: &[u16],
     ) -> VifScores {
-        let (w, h, bpc) = (self.width, self.height, self.bpc);
+        let geometry = self.geometry;
+        let (w, h, bpc) = (geometry.width(), geometry.height(), geometry.bpc());
         let gain_limit_mode = self.vif_gain_limit_mode;
         let backend = self.backend;
 
@@ -265,9 +244,17 @@ impl VifExtractor {
 
 #[cfg(test)]
 mod tests {
-    use vmaf_cpu::SimdBackend;
+    use vmaf_cpu::{FrameGeometry, FrameValidationError, GainLimit, SimdBackend};
 
     use super::*;
+
+    fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
+        FrameGeometry::new(width, height, bpc).unwrap()
+    }
+
+    fn gain_limit(value: f64) -> GainLimit {
+        GainLimit::new(value).unwrap()
+    }
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)
@@ -281,7 +268,8 @@ mod tests {
 
     #[test]
     fn workspace_path_matches_plain_compute() {
-        let extractor = VifExtractor::with_backend(48, 48, 8, 100.0, SimdBackend::Scalar).unwrap();
+        let extractor =
+            VifExtractor::with_backend(geometry(48, 48, 8), gain_limit(100.0), SimdBackend::Scalar);
         let reference = patterned_plane(48, 48, 255, 3);
         let distorted = patterned_plane(48, 48, 255, 17);
         let mut workspace = extractor.make_workspace();
@@ -303,22 +291,22 @@ mod tests {
     #[test]
     fn constructor_rejects_invalid_dimensions_and_bpc() {
         assert!(matches!(
-            VifExtractor::new(15, 16, 8, 100.0),
-            Err(VifError::InvalidDimensions {
+            FrameGeometry::new(15, 16, 8),
+            Err(FrameValidationError::InvalidDimensions {
                 width: 15,
                 height: 16
             })
         ));
         assert!(matches!(
-            VifExtractor::new(16, 15, 8, 100.0),
-            Err(VifError::InvalidDimensions {
+            FrameGeometry::new(16, 15, 8),
+            Err(FrameValidationError::InvalidDimensions {
                 width: 16,
                 height: 15
             })
         ));
         assert!(matches!(
-            VifExtractor::new(16, 16, 9, 100.0),
-            Err(VifError::InvalidBitDepth { bpc: 9 })
+            FrameGeometry::new(16, 16, 9),
+            Err(FrameValidationError::InvalidBitDepth { bpc: 9 })
         ));
     }
 }

@@ -1,15 +1,12 @@
 //! ADM feature extractor — spec §4.3
 
-use vmaf_cpu::{FrameValidationError, SimdBackend, validate_frame_geometry};
+use vmaf_cpu::{FrameGeometry, GainLimit, SimdBackend};
 
 use crate::{
     dwt::{Bands16Buffer, Bands32Buffer, Scale0DwtWorkspace, Scale123DwtWorkspace},
     score::{score_scale_s123, score_scale0},
     simd,
 };
-
-/// Errors produced by [`AdmExtractor`].
-pub type AdmError = FrameValidationError;
 
 /// Reusable internal buffers for per-frame ADM extraction.
 #[doc(hidden)]
@@ -56,30 +53,16 @@ fn copy_i16_slice_as_i32(dst: &mut Vec<i32>, src: &[i16]) {
 
 /// Stateless ADM extractor: computes the `adm2` score for one reference/distorted frame pair.
 pub struct AdmExtractor {
-    width: usize,
-    height: usize,
-    bpc: u8,
-    adm_enhn_gain_limit: f64,
+    geometry: FrameGeometry,
+    adm_enhn_gain_limit: GainLimit,
     backend: SimdBackend,
 }
 
 impl AdmExtractor {
     /// Create an ADM extractor for one frame geometry.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AdmError`] when dimensions are below the spec minimum, the
-    /// bit depth is unsupported, or the frame area overflows `usize`.
-    pub fn new(
-        width: usize,
-        height: usize,
-        bpc: u8,
-        adm_enhn_gain_limit: f64,
-    ) -> Result<Self, AdmError> {
+    pub fn new(geometry: FrameGeometry, adm_enhn_gain_limit: GainLimit) -> Self {
         Self::with_backend(
-            width,
-            height,
-            bpc,
+            geometry,
             adm_enhn_gain_limit,
             SimdBackend::detect_effective(),
         )
@@ -87,35 +70,28 @@ impl AdmExtractor {
 
     #[cfg(test)]
     pub(crate) fn with_backend_for_tests(
-        width: usize,
-        height: usize,
-        bpc: u8,
-        adm_enhn_gain_limit: f64,
+        geometry: FrameGeometry,
+        adm_enhn_gain_limit: GainLimit,
         backend: SimdBackend,
-    ) -> Result<Self, AdmError> {
-        Self::with_backend(width, height, bpc, adm_enhn_gain_limit, backend)
+    ) -> Self {
+        Self::with_backend(geometry, adm_enhn_gain_limit, backend)
     }
 
     fn with_backend(
-        width: usize,
-        height: usize,
-        bpc: u8,
-        adm_enhn_gain_limit: f64,
+        geometry: FrameGeometry,
+        adm_enhn_gain_limit: GainLimit,
         backend: SimdBackend,
-    ) -> Result<Self, AdmError> {
-        validate_frame_geometry(width, height, bpc)?;
-        Ok(Self {
-            width,
-            height,
-            bpc,
+    ) -> Self {
+        Self {
+            geometry,
             adm_enhn_gain_limit,
             backend: backend.effective(),
-        })
+        }
     }
 
     #[doc(hidden)]
     pub fn make_workspace(&self) -> AdmWorkspace {
-        AdmWorkspace::new(self.width, self.height)
+        AdmWorkspace::new(self.geometry.width(), self.geometry.height())
     }
 
     #[doc(hidden)]
@@ -125,8 +101,9 @@ impl AdmExtractor {
         ref_plane: &[u16],
         dis_plane: &[u16],
     ) -> f64 {
-        let (w, h, bpc) = (self.width, self.height, self.bpc);
-        let limit = self.adm_enhn_gain_limit;
+        let geometry = self.geometry;
+        let (w, h, bpc) = (geometry.width(), geometry.height(), geometry.bpc());
+        let limit = self.adm_enhn_gain_limit.value();
         let backend = self.backend;
 
         simd::dwt_scale0_into(
@@ -234,9 +211,17 @@ impl AdmExtractor {
 
 #[cfg(test)]
 mod tests {
-    use vmaf_cpu::SimdBackend;
+    use vmaf_cpu::{FrameGeometry, FrameValidationError, GainLimit, SimdBackend};
 
     use super::*;
+
+    fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
+        FrameGeometry::new(width, height, bpc).unwrap()
+    }
+
+    fn gain_limit(value: f64) -> GainLimit {
+        GainLimit::new(value).unwrap()
+    }
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)
@@ -250,8 +235,11 @@ mod tests {
 
     #[test]
     fn workspace_path_matches_plain_compute() {
-        let extractor =
-            AdmExtractor::with_backend_for_tests(64, 64, 8, 100.0, SimdBackend::Scalar).unwrap();
+        let extractor = AdmExtractor::with_backend_for_tests(
+            geometry(64, 64, 8),
+            gain_limit(100.0),
+            SimdBackend::Scalar,
+        );
         let reference = patterned_plane(64, 64, 255, 7);
         let distorted = patterned_plane(64, 64, 255, 23);
         let mut workspace = extractor.make_workspace();
@@ -269,22 +257,22 @@ mod tests {
     #[test]
     fn constructor_rejects_invalid_dimensions_and_bpc() {
         assert!(matches!(
-            AdmExtractor::new(15, 16, 8, 100.0),
-            Err(AdmError::InvalidDimensions {
+            FrameGeometry::new(15, 16, 8),
+            Err(FrameValidationError::InvalidDimensions {
                 width: 15,
                 height: 16
             })
         ));
         assert!(matches!(
-            AdmExtractor::new(16, 15, 8, 100.0),
-            Err(AdmError::InvalidDimensions {
+            FrameGeometry::new(16, 15, 8),
+            Err(FrameValidationError::InvalidDimensions {
                 width: 16,
                 height: 15
             })
         ));
         assert!(matches!(
-            AdmExtractor::new(16, 16, 9, 100.0),
-            Err(AdmError::InvalidBitDepth { bpc: 9 })
+            FrameGeometry::new(16, 16, 9),
+            Err(FrameValidationError::InvalidBitDepth { bpc: 9 })
         ));
     }
 }

@@ -481,6 +481,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror",
+ "vmaf-cpu",
 ]
 
 [[package]]

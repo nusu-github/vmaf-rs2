@@ -41,7 +41,8 @@ pub use bytemuck::try_cast_slice_mut;
 pub use bytemuck::{AnyBitPattern, NoUninit, Pod, PodCastError, Zeroable};
 pub use math::reflect_index;
 pub use validation::{
-    FrameValidationError, MIN_FRAME_DIMENSION, checked_sample_count, validate_frame_geometry,
+    FrameGeometry, FrameValidationError, GainLimit, GainLimitError, MIN_FRAME_DIMENSION,
+    checked_sample_count, validate_frame_geometry,
 };
 
 #[cfg(test)]

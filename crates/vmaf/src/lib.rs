@@ -9,14 +9,15 @@ use std::{
 
 use thiserror::Error;
 use vmaf_adm::{AdmExtractor, AdmWorkspace};
-use vmaf_cpu::{FrameValidationError, MIN_FRAME_DIMENSION, validate_frame_geometry};
+use vmaf_cpu::MIN_FRAME_DIMENSION;
+pub use vmaf_cpu::{FrameGeometry, FrameValidationError, GainLimit, GainLimitError};
 pub use vmaf_model::{
     LibsvmParseError, LoadModelError, ModelValidationError, PoolMethod, VmafModel, load_model,
 };
 use vmaf_model::{
     collect_scores, denormalize, normalize_features, pool, score_transform, svm_predict,
 };
-use vmaf_motion::{MotionError, MotionExtractor};
+use vmaf_motion::{Collecting as MotionCollecting, MotionError, MotionExtractor};
 use vmaf_vif::{VifExtractor, VifWorkspace};
 const MIN_PARALLEL_JOB_LEN: usize = 2;
 
@@ -40,9 +41,6 @@ pub enum VmafError {
     /// Distorted plane length does not match the configured frame size.
     #[error("invalid distorted plane length {actual}: expected exactly {required} samples")]
     InvalidDistortedLength { actual: usize, required: usize },
-    /// The context has already been flushed and is now terminal.
-    #[error("vmaf context has already been flushed")]
-    AlreadyFlushed,
     /// A lower-level motion error that should be surfaced to callers.
     #[error(transparent)]
     Motion(MotionError),
@@ -66,7 +64,6 @@ impl From<MotionError> for VmafError {
     fn from(err: MotionError) -> Self {
         match err {
             MotionError::FrameValidation(err) => err.into(),
-            MotionError::AlreadyFlushed => Self::AlreadyFlushed,
             MotionError::InvalidPlaneLength { actual, required }
             | MotionError::InvalidBlurredPlaneLength { actual, required } => {
                 Self::InvalidReferenceLength { actual, required }
@@ -127,68 +124,83 @@ pub struct VmafOptions {
     pub apply_score_transform: bool,
 }
 
-/// VMAF scoring context for a single video sequence.
-pub struct VmafContext {
-    model: VmafModel,
-    vif: VifExtractor,
+#[doc(hidden)]
+pub struct CollectingData {
     vif_workspace: VifWorkspace,
-    adm: AdmExtractor,
     adm_workspace: AdmWorkspace,
-    motion: MotionExtractor,
-    width: usize,
-    height: usize,
+    motion: MotionExtractor<MotionCollecting>,
     pending: VecDeque<PendingFrame>,
-    per_frame_scores: Vec<FrameScore>,
     frame_count: usize,
-    opts: VmafOptions,
-    flushed: bool,
 }
 
-impl VmafContext {
+#[doc(hidden)]
+pub struct FinalizedData;
+
+#[doc(hidden)]
+pub trait ContextState: private::Sealed {
+    #[doc(hidden)]
+    type Data;
+}
+
+/// VMAF context state that still accepts input frames.
+pub struct Collecting;
+
+/// VMAF context state after the final pending score has been finalized.
+pub struct Finalized;
+
+impl ContextState for Collecting {
+    type Data = CollectingData;
+}
+
+impl ContextState for Finalized {
+    type Data = FinalizedData;
+}
+
+mod private {
+    pub trait Sealed {}
+
+    impl Sealed for super::Collecting {}
+    impl Sealed for super::Finalized {}
+}
+
+/// VMAF scoring context for a single video sequence.
+pub struct VmafContext<S: ContextState = Collecting> {
+    model: VmafModel,
+    vif: VifExtractor,
+    adm: AdmExtractor,
+    geometry: FrameGeometry,
+    per_frame_scores: Vec<FrameScore>,
+    opts: VmafOptions,
+    state: S::Data,
+}
+
+impl VmafContext<Collecting> {
     /// Create a VMAF scoring context for one sequence.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VmafError`] when dimensions are below the spec minimum, the
-    /// bit depth is unsupported, or the frame area overflows `usize`.
-    pub fn new(model: VmafModel, width: usize, height: usize, bpc: u8) -> Result<Self, VmafError> {
-        Self::new_with_options(model, width, height, bpc, VmafOptions::default())
+    pub fn new(model: VmafModel, geometry: FrameGeometry) -> Self {
+        Self::new_with_options(model, geometry, VmafOptions::default())
     }
 
     /// Create a VMAF scoring context with custom options.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`VmafError`] when dimensions are below the spec minimum, the
-    /// bit depth is unsupported, or the frame area overflows `usize`.
-    pub fn new_with_options(
-        model: VmafModel,
-        width: usize,
-        height: usize,
-        bpc: u8,
-        opts: VmafOptions,
-    ) -> Result<Self, VmafError> {
-        validate_frame_geometry(width, height, bpc)?;
-
-        let vif = VifExtractor::new(width, height, bpc, model.vif_enhn_gain_limit)?;
+    pub fn new_with_options(model: VmafModel, geometry: FrameGeometry, opts: VmafOptions) -> Self {
+        let vif = VifExtractor::new(geometry, model.vif_enhn_gain_limit);
         let vif_workspace = vif.make_workspace();
-        let adm = AdmExtractor::new(width, height, bpc, model.adm_enhn_gain_limit)?;
+        let adm = AdmExtractor::new(geometry, model.adm_enhn_gain_limit);
         let adm_workspace = adm.make_workspace();
-        Ok(Self {
+        Self {
             vif,
-            vif_workspace,
             adm,
-            adm_workspace,
-            motion: MotionExtractor::new(width, height, bpc)?,
             model,
-            width,
-            height,
-            pending: VecDeque::with_capacity(2),
+            geometry,
             per_frame_scores: Vec::new(),
-            frame_count: 0,
             opts,
-            flushed: false,
-        })
+            state: CollectingData {
+                vif_workspace,
+                adm_workspace,
+                motion: MotionExtractor::new(geometry),
+                pending: VecDeque::with_capacity(2),
+                frame_count: 0,
+            },
+        }
     }
 
     /// Push a reference/distorted frame pair. Returns a `FrameScore` when one
@@ -196,8 +208,8 @@ impl VmafContext {
     ///
     /// # Errors
     ///
-    /// Returns [`VmafError`] if the context has already been flushed or either
-    /// plane does not match the configured frame size.
+    /// Returns [`VmafError`] if either plane does not match the configured frame
+    /// size.
     pub fn push_frame(
         &mut self,
         reference: &[u16],
@@ -211,8 +223,8 @@ impl VmafContext {
     ///
     /// # Errors
     ///
-    /// Returns [`VmafError`] if the context has already been flushed or any
-    /// frame pair does not match the configured frame size.
+    /// Returns [`VmafError`] if any frame pair does not match the configured
+    /// frame size.
     pub fn push_frame_batch(
         &mut self,
         frames: &[(&[u16], &[u16])],
@@ -237,7 +249,6 @@ impl VmafContext {
         mut timings: Option<&mut ProcessingTimings>,
     ) -> Result<Vec<FrameScore>, VmafError> {
         let validation_start = Instant::now();
-        self.ensure_active()?;
         for &(reference, distorted) in frames {
             self.validate_frame_inputs(reference, distorted)?;
         }
@@ -263,8 +274,8 @@ impl VmafContext {
 
         let vif = &self.vif;
         let adm = &self.adm;
-        let motion = &self.motion;
-        let stride = self.width;
+        let motion = &self.state.motion;
+        let stride = self.geometry.width();
         let processing_start = Instant::now();
         let feature_start = Instant::now();
         let min_job_len = frames
@@ -291,18 +302,18 @@ impl VmafContext {
         let mut out = Vec::with_capacity(frames.len());
         for (vif_scores, adm_score, blur) in extracted {
             let enqueue_start = Instant::now();
-            self.pending.push_back(PendingFrame {
-                frame_idx: self.frame_count,
+            self.state.pending.push_back(PendingFrame {
+                frame_idx: self.state.frame_count,
                 adm: adm_score,
                 vif: vif_scores.scale,
             });
-            self.frame_count += 1;
+            self.state.frame_count += 1;
             if let Some(timings) = timings.as_mut() {
                 timings.finalize += enqueue_start.elapsed();
             }
 
             let motion_start = Instant::now();
-            let motion_result = self.motion.push_blurred_frame(blur)?;
+            let motion_result = self.state.motion.push_blurred_frame(blur)?;
             if let Some(timings) = timings.as_mut() {
                 timings.motion += motion_start.elapsed();
             }
@@ -323,69 +334,46 @@ impl VmafContext {
         Ok(out)
     }
 
-    /// Flush the final pending frame. Call once after all frames are pushed.
-    ///
-    /// The first call makes the context terminal; subsequent calls return
-    /// `Ok(None)`.
-    pub fn flush(&mut self) -> Result<Option<FrameScore>, VmafError> {
-        if self.flushed {
-            return Ok(None);
+    /// Flush the final pending frame and transition into the finalized state.
+    pub fn flush(mut self) -> VmafContext<Finalized> {
+        let CollectingData {
+            motion,
+            mut pending,
+            ..
+        } = self.state;
+        let (_motion, pending_score) = motion.flush();
+        if let Some((idx, m2)) = pending_score {
+            let _ = finalize_frame_components(
+                &self.model,
+                self.opts,
+                &mut pending,
+                &mut self.per_frame_scores,
+                idx,
+                m2 as f64,
+            );
         }
-        self.flushed = true;
+        debug_assert!(pending.is_empty());
 
-        Ok(self
-            .motion
-            .flush()
-            .and_then(|(idx, m2)| self.finalize_frame(idx, m2 as f64)))
-    }
-
-    /// All finalized per-frame scores in frame-index order.
-    pub fn per_frame_scores(&self) -> &[FrameScore] {
-        &self.per_frame_scores
-    }
-
-    /// Pool all per-frame scores using the given method and subsampling factor.
-    pub fn pool_score(&self, method: PoolMethod, n_subsample: usize) -> f64 {
-        let scores: Vec<f64> = self.per_frame_scores.iter().map(|fs| fs.score).collect();
-        let n = scores.len();
-        if n == 0 {
-            return 0.0;
+        VmafContext {
+            model: self.model,
+            vif: self.vif,
+            adm: self.adm,
+            geometry: self.geometry,
+            per_frame_scores: self.per_frame_scores,
+            opts: self.opts,
+            state: FinalizedData,
         }
-        let selected = collect_scores(&scores, 0, n - 1, n_subsample);
-        pool(&selected, method)
     }
 
     fn finalize_frame(&mut self, idx: usize, m2: f64) -> Option<FrameScore> {
-        let pf = self.take_pending_frame(idx)?;
-
-        // Feature order: [adm2, motion2, vif_scale0, vif_scale1, vif_scale2, vif_scale3] — spec §6
-        let raw: [f64; 6] = [pf.adm, m2, pf.vif[0], pf.vif[1], pf.vif[2], pf.vif[3]];
-        let normed = normalize_features(
-            &raw,
-            &self.model.feature_slopes,
-            &self.model.feature_intercepts,
-        );
-        let raw_svm = svm_predict(&self.model.svm, &normed);
-        let denorm = denormalize(raw_svm, self.model.score_slope, self.model.score_intercept);
-        let st = if self.opts.apply_score_transform {
-            self.model.score_transform.as_ref()
-        } else {
-            None
-        };
-        let score = score_transform(denorm, st, self.model.score_clip);
-
-        let fs = FrameScore {
-            frame_index: idx,
-            score,
-            adm2: pf.adm,
-            motion2: m2,
-            vif_scale0: pf.vif[0],
-            vif_scale1: pf.vif[1],
-            vif_scale2: pf.vif[2],
-            vif_scale3: pf.vif[3],
-        };
-        self.per_frame_scores.push(fs);
-        Some(fs)
+        finalize_frame_components(
+            &self.model,
+            self.opts,
+            &mut self.state.pending,
+            &mut self.per_frame_scores,
+            idx,
+            m2,
+        )
     }
 
     fn push_frame_impl(
@@ -399,7 +387,6 @@ impl VmafContext {
 
         if validate_inputs {
             let validation_start = Instant::now();
-            self.ensure_active()?;
             self.validate_frame_inputs(reference, distorted)?;
             if let Some(timings) = timings.as_mut() {
                 timings.validation += validation_start.elapsed();
@@ -407,29 +394,36 @@ impl VmafContext {
         }
 
         let feature_start = Instant::now();
-        let vif_scores =
-            self.vif
-                .compute_frame_with_workspace(&mut self.vif_workspace, reference, distorted);
-        let adm_score =
-            self.adm
-                .compute_frame_with_workspace(&mut self.adm_workspace, reference, distorted);
+        let vif_scores = self.vif.compute_frame_with_workspace(
+            &mut self.state.vif_workspace,
+            reference,
+            distorted,
+        );
+        let adm_score = self.adm.compute_frame_with_workspace(
+            &mut self.state.adm_workspace,
+            reference,
+            distorted,
+        );
         if let Some(timings) = timings.as_mut() {
             timings.feature_extraction += feature_start.elapsed();
         }
 
         let motion_start = Instant::now();
-        let motion_result = self.motion.push_frame(reference, self.width)?;
+        let motion_result = self
+            .state
+            .motion
+            .push_frame(reference, self.geometry.width())?;
         if let Some(timings) = timings.as_mut() {
             timings.motion += motion_start.elapsed();
         }
 
         let finalize_start = Instant::now();
-        self.pending.push_back(PendingFrame {
-            frame_idx: self.frame_count,
+        self.state.pending.push_back(PendingFrame {
+            frame_idx: self.state.frame_count,
             adm: adm_score,
             vif: vif_scores.scale,
         });
-        self.frame_count += 1;
+        self.state.frame_count += 1;
 
         let result = motion_result.and_then(|(idx, m2)| self.finalize_frame(idx, m2 as f64));
         if let Some(timings) = timings.as_mut() {
@@ -439,29 +433,8 @@ impl VmafContext {
         Ok(result)
     }
 
-    fn take_pending_frame(&mut self, idx: usize) -> Option<PendingFrame> {
-        match self.pending.front() {
-            Some(front) if front.frame_idx == idx => self.pending.pop_front(),
-            _ => {
-                let pos = self.pending.iter().position(|p| p.frame_idx == idx)?;
-                self.pending.remove(pos)
-            }
-        }
-    }
-
-    fn frame_len(&self) -> usize {
-        self.width * self.height
-    }
-
-    fn ensure_active(&self) -> Result<(), VmafError> {
-        if self.flushed {
-            return Err(VmafError::AlreadyFlushed);
-        }
-        Ok(())
-    }
-
     fn validate_frame_inputs(&self, reference: &[u16], distorted: &[u16]) -> Result<(), VmafError> {
-        let required = self.frame_len();
+        let required = self.geometry.sample_count();
         if reference.len() != required {
             return Err(VmafError::InvalidReferenceLength {
                 actual: reference.len(),
@@ -478,9 +451,73 @@ impl VmafContext {
     }
 }
 
+impl VmafContext<Finalized> {
+    /// All finalized per-frame scores in frame-index order.
+    pub fn per_frame_scores(&self) -> &[FrameScore] {
+        &self.per_frame_scores
+    }
+
+    /// Pool all per-frame scores using the given method and subsampling factor.
+    pub fn pool_score(&self, method: PoolMethod, n_subsample: usize) -> f64 {
+        let scores: Vec<f64> = self.per_frame_scores.iter().map(|fs| fs.score).collect();
+        let n = scores.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let selected = collect_scores(&scores, 0, n - 1, n_subsample);
+        pool(&selected, method)
+    }
+}
+
+fn finalize_frame_components(
+    model: &VmafModel,
+    opts: VmafOptions,
+    pending: &mut VecDeque<PendingFrame>,
+    per_frame_scores: &mut Vec<FrameScore>,
+    idx: usize,
+    m2: f64,
+) -> Option<FrameScore> {
+    let pf = match pending.front() {
+        Some(front) if front.frame_idx == idx => pending.pop_front(),
+        _ => {
+            let pos = pending.iter().position(|p| p.frame_idx == idx)?;
+            pending.remove(pos)
+        }
+    }?;
+
+    // Feature order: [adm2, motion2, vif_scale0, vif_scale1, vif_scale2, vif_scale3] — spec §6
+    let raw: [f64; 6] = [pf.adm, m2, pf.vif[0], pf.vif[1], pf.vif[2], pf.vif[3]];
+    let normed = normalize_features(&raw, &model.feature_slopes, &model.feature_intercepts);
+    let raw_svm = svm_predict(&model.svm, &normed);
+    let denorm = denormalize(raw_svm, model.score_slope, model.score_intercept);
+    let st = if opts.apply_score_transform {
+        model.score_transform.as_ref()
+    } else {
+        None
+    };
+    let score = score_transform(denorm, st, model.score_clip);
+
+    let fs = FrameScore {
+        frame_index: idx,
+        score,
+        adm2: pf.adm,
+        motion2: m2,
+        vif_scale0: pf.vif[0],
+        vif_scale1: pf.vif[1],
+        vif_scale2: pf.vif[2],
+        vif_scale3: pf.vif[3],
+    };
+    per_frame_scores.push(fs);
+    Some(fs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
+        FrameGeometry::new(width, height, bpc).unwrap()
+    }
 
     #[test]
     fn parallel_job_len_has_two_frame_floor() {
@@ -493,10 +530,10 @@ mod tests {
         let pos = load_model(include_str!("../../../models/vmaf_v0.6.1.json")).unwrap();
         let neg = load_model(include_str!("../../../models/vmaf_v0.6.1neg.json")).unwrap();
 
-        assert_eq!(pos.adm_enhn_gain_limit, 100.0);
-        assert_eq!(pos.vif_enhn_gain_limit, 100.0);
-        assert_eq!(neg.adm_enhn_gain_limit, 1.0);
-        assert_eq!(neg.vif_enhn_gain_limit, 1.0);
+        assert_eq!(pos.adm_enhn_gain_limit.value(), 100.0);
+        assert_eq!(pos.vif_enhn_gain_limit.value(), 100.0);
+        assert_eq!(neg.adm_enhn_gain_limit.value(), 1.0);
+        assert_eq!(neg.vif_enhn_gain_limit.value(), 1.0);
 
         let (w, h, bpc) = (64usize, 64usize, 8u8);
 
@@ -505,16 +542,16 @@ mod tests {
             .collect();
         let distorted: Vec<u16> = reference.iter().map(|&v| (v * 2).min(255)).collect();
 
-        let mut ctx_pos = VmafContext::new(pos, w, h, bpc).unwrap();
-        let mut ctx_neg = VmafContext::new(neg, w, h, bpc).unwrap();
+        let mut ctx_pos = VmafContext::new(pos, geometry(w, h, bpc));
+        let mut ctx_neg = VmafContext::new(neg, geometry(w, h, bpc));
 
         // Push 2 frames to satisfy motion's 1-frame lag.
         for _ in 0..2 {
             ctx_pos.push_frame(&reference, &distorted).unwrap();
             ctx_neg.push_frame(&reference, &distorted).unwrap();
         }
-        ctx_pos.flush().unwrap();
-        ctx_neg.flush().unwrap();
+        let ctx_pos: VmafContext<Finalized> = ctx_pos.flush();
+        let ctx_neg: VmafContext<Finalized> = ctx_neg.flush();
 
         let a = ctx_pos.per_frame_scores();
         let b = ctx_neg.per_frame_scores();
@@ -558,18 +595,13 @@ mod tests {
             })
             .collect();
 
-        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc).unwrap();
-        let mut batch = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc).unwrap();
+        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), geometry(w, h, bpc));
+        let mut batch = VmafContext::new(load_model(model_json).unwrap(), geometry(w, h, bpc));
 
-        let mut sequential_scores = Vec::new();
         for (reference, distorted) in &frames {
-            if let Some(score) = sequential.push_frame(reference, distorted).unwrap() {
-                sequential_scores.push(score);
-            }
+            sequential.push_frame(reference, distorted).unwrap();
         }
-        if let Some(score) = sequential.flush().unwrap() {
-            sequential_scores.push(score);
-        }
+        let sequential: VmafContext<Finalized> = sequential.flush();
 
         let batch_inputs_a: Vec<_> = frames[..3]
             .iter()
@@ -580,15 +612,15 @@ mod tests {
             .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
             .collect();
 
-        let mut batch_scores = batch.push_frame_batch(&batch_inputs_a).unwrap();
-        batch_scores.extend(batch.push_frame_batch(&batch_inputs_b).unwrap());
-        if let Some(score) = batch.flush().unwrap() {
-            batch_scores.push(score);
-        }
+        batch.push_frame_batch(&batch_inputs_a).unwrap();
+        batch.push_frame_batch(&batch_inputs_b).unwrap();
+        let batch: VmafContext<Finalized> = batch.flush();
+        let sequential_scores = sequential.per_frame_scores();
+        let batch_scores = batch.per_frame_scores();
 
         assert_eq!(sequential_scores.len(), batch_scores.len());
 
-        for (sequential_score, batch_score) in sequential_scores.iter().zip(&batch_scores) {
+        for (sequential_score, batch_score) in sequential_scores.iter().zip(batch_scores.iter()) {
             assert_eq!(sequential_score.frame_index, batch_score.frame_index);
             assert_eq!(
                 sequential_score.score.to_bits(),
@@ -645,18 +677,13 @@ mod tests {
             })
             .collect();
 
-        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc).unwrap();
-        let mut batch = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc).unwrap();
+        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), geometry(w, h, bpc));
+        let mut batch = VmafContext::new(load_model(model_json).unwrap(), geometry(w, h, bpc));
 
-        let mut sequential_scores = Vec::new();
         for (reference, distorted) in &frames {
-            if let Some(score) = sequential.push_frame(reference, distorted).unwrap() {
-                sequential_scores.push(score);
-            }
+            sequential.push_frame(reference, distorted).unwrap();
         }
-        if let Some(score) = sequential.flush().unwrap() {
-            sequential_scores.push(score);
-        }
+        let sequential: VmafContext<Finalized> = sequential.flush();
 
         let batch_inputs_a: Vec<_> = frames[..1]
             .iter()
@@ -671,16 +698,16 @@ mod tests {
             .map(|(reference, distorted)| (reference.as_slice(), distorted.as_slice()))
             .collect();
 
-        let mut batch_scores = batch.push_frame_batch(&batch_inputs_a).unwrap();
-        batch_scores.extend(batch.push_frame_batch(&batch_inputs_b).unwrap());
-        batch_scores.extend(batch.push_frame_batch(&batch_inputs_c).unwrap());
-        if let Some(score) = batch.flush().unwrap() {
-            batch_scores.push(score);
-        }
+        batch.push_frame_batch(&batch_inputs_a).unwrap();
+        batch.push_frame_batch(&batch_inputs_b).unwrap();
+        batch.push_frame_batch(&batch_inputs_c).unwrap();
+        let batch: VmafContext<Finalized> = batch.flush();
+        let sequential_scores = sequential.per_frame_scores();
+        let batch_scores = batch.per_frame_scores();
 
         assert_eq!(sequential_scores.len(), batch_scores.len());
 
-        for (sequential_score, batch_score) in sequential_scores.iter().zip(&batch_scores) {
+        for (sequential_score, batch_score) in sequential_scores.iter().zip(batch_scores.iter()) {
             assert_eq!(sequential_score.frame_index, batch_score.frame_index);
             assert_eq!(
                 sequential_score.score.to_bits(),
@@ -734,19 +761,14 @@ mod tests {
             })
             .collect();
 
-        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), w, h, bpc).unwrap();
+        let mut sequential = VmafContext::new(load_model(model_json).unwrap(), geometry(w, h, bpc));
         let mut single_thread_batch =
-            VmafContext::new(load_model(model_json).unwrap(), w, h, bpc).unwrap();
+            VmafContext::new(load_model(model_json).unwrap(), geometry(w, h, bpc));
 
-        let mut sequential_scores = Vec::new();
         for (reference, distorted) in &frames {
-            if let Some(score) = sequential.push_frame(reference, distorted).unwrap() {
-                sequential_scores.push(score);
-            }
+            sequential.push_frame(reference, distorted).unwrap();
         }
-        if let Some(score) = sequential.flush().unwrap() {
-            sequential_scores.push(score);
-        }
+        let sequential: VmafContext<Finalized> = sequential.flush();
 
         let batch_inputs: Vec<_> = frames
             .iter()
@@ -756,15 +778,14 @@ mod tests {
             .num_threads(1)
             .build()
             .unwrap();
-        let mut batch_scores =
-            pool.install(|| single_thread_batch.push_frame_batch(&batch_inputs).unwrap());
-        if let Some(score) = single_thread_batch.flush().unwrap() {
-            batch_scores.push(score);
-        }
+        pool.install(|| single_thread_batch.push_frame_batch(&batch_inputs).unwrap());
+        let single_thread_batch: VmafContext<Finalized> = single_thread_batch.flush();
+        let sequential_scores = sequential.per_frame_scores();
+        let batch_scores = single_thread_batch.per_frame_scores();
 
         assert_eq!(sequential_scores.len(), batch_scores.len());
 
-        for (sequential_score, batch_score) in sequential_scores.iter().zip(&batch_scores) {
+        for (sequential_score, batch_score) in sequential_scores.iter().zip(batch_scores.iter()) {
             assert_eq!(sequential_score.frame_index, batch_score.frame_index);
             assert_eq!(
                 sequential_score.score.to_bits(),
@@ -797,42 +818,27 @@ mod tests {
     #[test]
     fn context_rejects_invalid_dimensions_and_bpc() {
         assert!(matches!(
-            VmafContext::new(
-                load_model(include_str!("../../../models/vmaf_v0.6.1.json")).unwrap(),
-                15,
-                16,
-                8
-            ),
-            Err(VmafError::InvalidDimensions {
+            FrameGeometry::new(15, 16, 8),
+            Err(FrameValidationError::InvalidDimensions {
                 width: 15,
                 height: 16
             })
         ));
         assert!(matches!(
-            VmafContext::new(
-                load_model(include_str!("../../../models/vmaf_v0.6.1.json")).unwrap(),
-                16,
-                15,
-                8
-            ),
-            Err(VmafError::InvalidDimensions {
+            FrameGeometry::new(16, 15, 8),
+            Err(FrameValidationError::InvalidDimensions {
                 width: 16,
                 height: 15
             })
         ));
         assert!(matches!(
-            VmafContext::new(
-                load_model(include_str!("../../../models/vmaf_v0.6.1.json")).unwrap(),
-                16,
-                16,
-                9
-            ),
-            Err(VmafError::InvalidBitDepth { bpc: 9 })
+            FrameGeometry::new(16, 16, 9),
+            Err(FrameValidationError::InvalidBitDepth { bpc: 9 })
         ));
     }
 
     #[test]
-    fn flush_is_terminal_and_idempotent() {
+    fn flush_transitions_to_finalized_state() {
         let model = load_model(include_str!("../../../models/vmaf_v0.6.1.json")).unwrap();
         let (w, h, bpc) = (64usize, 64usize, 8u8);
         let reference: Vec<u16> = (0..h)
@@ -844,22 +850,13 @@ mod tests {
             .map(|(idx, &value)| value.saturating_sub((idx % 17) as u16))
             .collect::<Vec<_>>();
 
-        let mut ctx = VmafContext::new(model, w, h, bpc).unwrap();
+        let mut ctx = VmafContext::new(model, geometry(w, h, bpc));
         assert!(ctx.push_frame(&reference, &distorted).unwrap().is_some());
         assert!(ctx.push_frame(&reference, &distorted).unwrap().is_none());
 
-        let flushed = ctx.flush().unwrap();
-        assert!(flushed.is_some());
-        assert_eq!(flushed.unwrap().frame_index, 1);
-        assert!(ctx.flush().unwrap().is_none());
-        assert_eq!(
-            ctx.push_frame(&reference, &distorted).unwrap_err(),
-            VmafError::AlreadyFlushed
-        );
-        assert_eq!(
-            ctx.push_frame_batch(&[(&reference, &distorted)])
-                .unwrap_err(),
-            VmafError::AlreadyFlushed
-        );
+        let ctx: VmafContext<Finalized> = ctx.flush();
+        assert_eq!(ctx.per_frame_scores().len(), 2);
+        assert_eq!(ctx.per_frame_scores()[1].frame_index, 1);
+        assert!(ctx.pool_score(PoolMethod::Mean, 1).is_finite());
     }
 }

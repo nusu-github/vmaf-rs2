@@ -11,11 +11,12 @@ mod math;
 mod stat;
 mod tables;
 
-pub use extractor::{VifError, VifExtractor, VifScores, VifWorkspace};
+pub use extractor::{VifExtractor, VifScores, VifWorkspace};
+pub use vmaf_cpu::{FrameGeometry, GainLimit};
 
 #[cfg(test)]
 mod tests {
-    use vmaf_cpu::SimdBackend;
+    use vmaf_cpu::{FrameGeometry, GainLimit, SimdBackend};
 
     use super::{
         extractor::VifExtractor,
@@ -24,6 +25,14 @@ mod tests {
         stat::vif_statistic,
         tables::LOG2_TABLE,
     };
+
+    fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
+        FrameGeometry::new(width, height, bpc).unwrap()
+    }
+
+    fn gain_limit(value: f64) -> GainLimit {
+        GainLimit::new(value).unwrap()
+    }
 
     fn patterned_plane(width: usize, height: usize, modulus: u16, bias: usize) -> Vec<u16> {
         (0..height)
@@ -138,7 +147,8 @@ mod tests {
         let w = 32;
         let h = 32;
         let frame = vec![128u16; w * h];
-        let ext = VifExtractor::with_backend(w, h, 8, 100.0, SimdBackend::Scalar).unwrap();
+        let ext =
+            VifExtractor::with_backend(geometry(w, h, 8), gain_limit(100.0), SimdBackend::Scalar);
         let s = ext.compute_frame(&frame, &frame);
         for sc in 0..4 {
             assert!(
@@ -155,7 +165,8 @@ mod tests {
         let w = 32;
         let h = 32;
         let frame: Vec<u16> = (0..h).flat_map(|_| 0u16..w as u16).collect();
-        let ext = VifExtractor::with_backend(w, h, 8, 100.0, SimdBackend::Scalar).unwrap();
+        let ext =
+            VifExtractor::with_backend(geometry(w, h, 8), gain_limit(100.0), SimdBackend::Scalar);
         let s = ext.compute_frame(&frame, &frame);
         for sc in 0..4 {
             assert!(s.scale[sc] >= 0.99, "scale {sc}: {}", s.scale[sc]);
@@ -322,8 +333,9 @@ mod tests {
         let h = 38;
         let ref_plane = patterned_plane(w, h, 1024, 3);
         let dis_plane = patterned_plane(w, h, 1024, 67);
-        let scalar = VifExtractor::with_backend(w, h, 10, 100.0, SimdBackend::Scalar).unwrap();
-        let simd = VifExtractor::with_backend(w, h, 10, 100.0, backend).unwrap();
+        let scalar =
+            VifExtractor::with_backend(geometry(w, h, 10), gain_limit(100.0), SimdBackend::Scalar);
+        let simd = VifExtractor::with_backend(geometry(w, h, 10), gain_limit(100.0), backend);
         let scalar_scores = scalar.compute_frame(&ref_plane, &dis_plane);
         let simd_scores = simd.compute_frame(&ref_plane, &dis_plane);
         assert_scores_match(&scalar_scores, &simd_scores);
@@ -353,7 +365,8 @@ mod tests {
             }
         }
 
-        let scalar = VifExtractor::with_backend(w, h, bpc, 100.0, SimdBackend::Scalar).unwrap();
+        let scalar =
+            VifExtractor::with_backend(geometry(w, h, bpc), gain_limit(100.0), SimdBackend::Scalar);
         let expected = scalar.compute_frame(ref_plane, dis_plane);
 
         for backend in [SimdBackend::X86Sse2, SimdBackend::X86Avx2Fma] {
@@ -361,7 +374,7 @@ mod tests {
                 continue;
             }
 
-            let simd = VifExtractor::with_backend(w, h, bpc, 100.0, backend).unwrap();
+            let simd = VifExtractor::with_backend(geometry(w, h, bpc), gain_limit(100.0), backend);
             let actual = simd.compute_frame(ref_plane, dis_plane);
             assert_scores_match(&expected, &actual);
         }

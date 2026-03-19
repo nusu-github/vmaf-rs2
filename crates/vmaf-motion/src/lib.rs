@@ -9,19 +9,23 @@ mod blur;
 mod sad;
 mod simd;
 
-pub use extractor::{MotionError, MotionExtractor};
+pub use extractor::{Collecting, Flushed, MotionError, MotionExtractor};
 mod extractor;
+pub use vmaf_cpu::FrameGeometry;
 
 #[cfg(test)]
 mod tests {
-    use vmaf_cpu::FrameValidationError;
-    use vmaf_cpu::SimdBackend;
+    use vmaf_cpu::{FrameGeometry, FrameValidationError, SimdBackend};
 
     use super::{
-        MotionError, MotionExtractor,
+        Flushed, MotionExtractor,
         blur::{blur_frame, blur_frame_scalar_reference, blur_frame_with_backend},
         sad::{compute_sad, compute_sad_scalar_reference, compute_sad_with_backend},
     };
+
+    fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
+        FrameGeometry::new(width, height, bpc).unwrap()
+    }
 
     fn patterned_frame(width: usize, height: usize, stride: usize, modulo: usize) -> Vec<u16> {
         let mut frame = vec![u16::MAX; stride * height];
@@ -202,20 +206,22 @@ mod tests {
     /// Single frame: push returns motion2[0] = 0.0; flush returns None.
     #[test]
     fn motion_single_frame() {
-        let mut m = MotionExtractor::new(16, 16, 8).unwrap();
+        let mut m = MotionExtractor::new(geometry(16, 16, 8));
         let frame = vec![100u16; 16 * 16];
         assert_eq!(m.push_frame(&frame, 16).unwrap(), Some((0, 0.0_f32)));
-        assert_eq!(m.flush(), None);
+        let (_m, pending) = m.flush();
+        assert_eq!(pending, None);
     }
 
     /// Two identical frames: motion2[0]=0, motion2[1]=0 via flush.
     #[test]
     fn motion_identical_frames() {
-        let mut m = MotionExtractor::new(16, 16, 8).unwrap();
+        let mut m = MotionExtractor::new(geometry(16, 16, 8));
         let frame = vec![100u16; 16 * 16];
         assert_eq!(m.push_frame(&frame, 16).unwrap(), Some((0, 0.0_f32)));
         assert_eq!(m.push_frame(&frame, 16).unwrap(), None);
-        assert_eq!(m.flush(), Some((1, 0.0_f32)));
+        let (_m, pending) = m.flush();
+        assert_eq!(pending, Some((1, 0.0_f32)));
     }
 
     /// Three frames: f0=100, f1=200, f2=100.
@@ -228,7 +234,7 @@ mod tests {
     fn motion_three_frames() {
         let w = 16;
         let h = 16;
-        let mut m = MotionExtractor::new(w, h, 8).unwrap();
+        let mut m = MotionExtractor::new(geometry(w, h, 8));
         let f0 = vec![100u16; w * h];
         let f1 = vec![200u16; w * h];
         let f2 = vec![100u16; w * h];
@@ -242,7 +248,7 @@ mod tests {
             (score - 100.0_f32).abs() < 0.5,
             "expected ~100.0, got {score}"
         );
-        let flush = m.flush();
+        let (_m, flush) = m.flush();
         assert!(flush.is_some());
         let (fidx, fscore) = flush.unwrap();
         assert_eq!(fidx, 2);
@@ -255,13 +261,13 @@ mod tests {
     /// §8: flush must emit the pending motion2[n_last] score — spec §4.4.2
     #[test]
     fn motion_flush_emits_pending_score() {
-        let mut m = MotionExtractor::new(16, 16, 8).unwrap();
+        let mut m = MotionExtractor::new(geometry(16, 16, 8));
         let fa = vec![100u16; 16 * 16];
         let fb = vec![200u16; 16 * 16]; // different frame
         m.push_frame(&fa, 16).unwrap();
         m.push_frame(&fb, 16).unwrap();
         // flush must return the pending motion2[1] = motion1[1]
-        let result = m.flush();
+        let (_m, result) = m.flush();
         assert!(result.is_some(), "flush must return Some for n_last >= 1");
         assert_eq!(result.unwrap().0, 1, "frame index must be 1");
     }
@@ -269,44 +275,34 @@ mod tests {
     #[test]
     fn motion_rejects_invalid_dimensions_and_bpc() {
         assert!(matches!(
-            MotionExtractor::new(15, 16, 8),
-            Err(MotionError::FrameValidation(
-                FrameValidationError::InvalidDimensions {
-                    width: 15,
-                    height: 16,
-                }
-            ))
+            FrameGeometry::new(15, 16, 8),
+            Err(FrameValidationError::InvalidDimensions {
+                width: 15,
+                height: 16,
+            })
         ));
         assert!(matches!(
-            MotionExtractor::new(16, 15, 8),
-            Err(MotionError::FrameValidation(
-                FrameValidationError::InvalidDimensions {
-                    width: 16,
-                    height: 15,
-                }
-            ))
+            FrameGeometry::new(16, 15, 8),
+            Err(FrameValidationError::InvalidDimensions {
+                width: 16,
+                height: 15,
+            })
         ));
         assert!(matches!(
-            MotionExtractor::new(16, 16, 9),
-            Err(MotionError::FrameValidation(
-                FrameValidationError::InvalidBitDepth { bpc: 9 }
-            ))
+            FrameGeometry::new(16, 16, 9),
+            Err(FrameValidationError::InvalidBitDepth { bpc: 9 })
         ));
     }
 
     #[test]
-    fn motion_flush_is_one_shot_and_terminal() {
-        let mut m = MotionExtractor::new(16, 16, 8).unwrap();
+    fn motion_flush_transitions_to_flushed_state() {
+        let mut m = MotionExtractor::new(geometry(16, 16, 8));
         let frame = vec![100u16; 16 * 16];
 
         assert_eq!(m.push_frame(&frame, 16).unwrap(), Some((0, 0.0_f32)));
-        assert_eq!(m.flush(), None);
-        assert_eq!(m.flush(), None);
-        assert_eq!(m.push_frame(&frame, 16), Err(MotionError::AlreadyFlushed));
-        assert_eq!(
-            m.push_blurred_frame(vec![0u16; 16 * 16]),
-            Err(MotionError::AlreadyFlushed)
-        );
+        let (m, pending): (MotionExtractor<Flushed>, Option<(usize, f32)>) = m.flush();
+        let _ = m;
+        assert_eq!(pending, None);
     }
 
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
@@ -333,8 +329,8 @@ mod tests {
             .collect();
 
         let mut scalar =
-            MotionExtractor::with_backend_for_tests(w, h, bpc, SimdBackend::Scalar).unwrap();
-        let mut simd = MotionExtractor::with_backend_for_tests(w, h, bpc, requested).unwrap();
+            MotionExtractor::with_backend_for_tests(geometry(w, h, bpc), SimdBackend::Scalar);
+        let mut simd = MotionExtractor::with_backend_for_tests(geometry(w, h, bpc), requested);
 
         for frame in &frames {
             let scalar_blur = scalar.prepare_blurred_frame(frame, stride);
@@ -346,6 +342,8 @@ mod tests {
             );
         }
 
-        assert_eq!(scalar.flush(), simd.flush());
+        let (_scalar, scalar_pending) = scalar.flush();
+        let (_simd, simd_pending) = simd.flush();
+        assert_eq!(scalar_pending, simd_pending);
     }
 }

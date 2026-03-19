@@ -10,7 +10,8 @@ use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 use thiserror::Error;
 use vmaf::{
-    LoadModelError, PoolMethod, ProcessingTimings, VmafContext, VmafError, VmafOptions, load_model,
+    Finalized, FrameGeometry, LoadModelError, PoolMethod, ProcessingTimings, VmafContext,
+    VmafError, VmafOptions, load_model,
 };
 
 #[derive(Debug, Parser)]
@@ -26,8 +27,8 @@ struct Args {
     #[arg(short, long)]
     model: PathBuf,
     /// Pooling method: mean, harmonic_mean, min, max
-    #[arg(long, default_value = "mean")]
-    pool_method: String,
+    #[arg(long, default_value = "mean", value_parser = parse_pool_method)]
+    pool_method: PoolMethod,
     /// Frame subsampling factor (1 = all frames)
     #[arg(long, default_value_t = 1)]
     n_subsample: usize,
@@ -56,10 +57,7 @@ enum ColorspaceFamily {
 
 #[derive(Debug, Clone)]
 struct StreamMetadata {
-    stream: &'static str,
-    width: usize,
-    height: usize,
-    bit_depth: u8,
+    geometry: FrameGeometry,
     colorspace: String,
     colorspace_family: ColorspaceFamily,
 }
@@ -180,8 +178,6 @@ enum MainError {
     Decoder(#[from] y4m::Error),
     #[error(transparent)]
     Model(#[from] LoadModelError),
-    #[error(transparent)]
-    PoolMethod(#[from] PoolMethodParseError),
     #[error(transparent)]
     Cli(#[from] CliError),
     #[error(transparent)]
@@ -335,6 +331,15 @@ fn parse_pool_method(s: &str) -> Result<PoolMethod, PoolMethodParseError> {
     }
 }
 
+fn pool_method_label(method: PoolMethod) -> &'static str {
+    match method {
+        PoolMethod::Mean => "mean",
+        PoolMethod::HarmonicMean => "harmonic_mean",
+        PoolMethod::Min => "min",
+        PoolMethod::Max => "max",
+    }
+}
+
 fn colorspace_family(colorspace: y4m::Colorspace) -> Option<ColorspaceFamily> {
     match colorspace {
         y4m::Colorspace::Cmono | y4m::Colorspace::Cmono12 => Some(ColorspaceFamily::Mono),
@@ -365,65 +370,76 @@ fn read_stream_metadata<R: Read>(
             stream,
             colorspace: colorspace_label.clone(),
         })?;
+    let geometry = stream_geometry(
+        stream,
+        decoder.get_width(),
+        decoder.get_height(),
+        colorspace.get_bit_depth() as u8,
+        &colorspace_label,
+    )?;
 
     Ok(StreamMetadata {
-        stream,
-        width: decoder.get_width(),
-        height: decoder.get_height(),
-        bit_depth: colorspace.get_bit_depth() as u8,
+        geometry,
         colorspace: colorspace_label,
         colorspace_family,
     })
 }
 
-fn validate_single_stream(metadata: &StreamMetadata) -> Result<(), CliError> {
-    if metadata.width < 16 || metadata.height < 16 {
-        return Err(CliError::InvalidDimensions {
-            stream: metadata.stream,
-            width: metadata.width,
-            height: metadata.height,
-        });
-    }
-
-    if !matches!(metadata.bit_depth, 8 | 10 | 12) {
-        return Err(CliError::InvalidBitDepth {
-            stream: metadata.stream,
-            bit_depth: metadata.bit_depth,
-            colorspace: metadata.colorspace.clone(),
-        });
-    }
-
-    Ok(())
+fn stream_geometry(
+    stream: &'static str,
+    width: usize,
+    height: usize,
+    bit_depth: u8,
+    colorspace: &str,
+) -> Result<FrameGeometry, CliError> {
+    FrameGeometry::new(width, height, bit_depth).map_err(|err| match err {
+        vmaf::FrameValidationError::InvalidDimensions { width, height } => {
+            CliError::InvalidDimensions {
+                stream,
+                width,
+                height,
+            }
+        }
+        vmaf::FrameValidationError::InvalidBitDepth { bpc } => CliError::InvalidBitDepth {
+            stream,
+            bit_depth: bpc,
+            colorspace: colorspace.to_string(),
+        },
+        vmaf::FrameValidationError::SampleCountOverflow { width, height } => {
+            CliError::InvalidDimensions {
+                stream,
+                width,
+                height,
+            }
+        }
+    })
 }
 
 fn validate_stream_metadata(
     reference: &StreamMetadata,
     distorted: &StreamMetadata,
-) -> Result<(), CliError> {
-    validate_single_stream(reference)?;
-    validate_single_stream(distorted)?;
-
-    if reference.width != distorted.width {
+) -> Result<FrameGeometry, CliError> {
+    if reference.geometry.width() != distorted.geometry.width() {
         return Err(CliError::MetadataMismatch {
             field: "width",
-            reference: reference.width.to_string(),
-            distorted: distorted.width.to_string(),
+            reference: reference.geometry.width().to_string(),
+            distorted: distorted.geometry.width().to_string(),
         });
     }
 
-    if reference.height != distorted.height {
+    if reference.geometry.height() != distorted.geometry.height() {
         return Err(CliError::MetadataMismatch {
             field: "height",
-            reference: reference.height.to_string(),
-            distorted: distorted.height.to_string(),
+            reference: reference.geometry.height().to_string(),
+            distorted: distorted.geometry.height().to_string(),
         });
     }
 
-    if reference.bit_depth != distorted.bit_depth {
+    if reference.geometry.bpc() != distorted.geometry.bpc() {
         return Err(CliError::MetadataMismatch {
             field: "bit depth",
-            reference: reference.bit_depth.to_string(),
-            distorted: distorted.bit_depth.to_string(),
+            reference: reference.geometry.bpc().to_string(),
+            distorted: distorted.geometry.bpc().to_string(),
         });
     }
 
@@ -434,7 +450,7 @@ fn validate_stream_metadata(
         });
     }
 
-    Ok(())
+    Ok(reference.geometry)
 }
 
 fn read_luma_pair_into_with_timings<R1: Read, R2: Read>(
@@ -580,7 +596,7 @@ where
     Ok(frame_count)
 }
 
-fn emit_full_json(ctx: &VmafContext, pooled: f64, pool_method: &str) {
+fn emit_full_json(ctx: &VmafContext<Finalized>, pooled: f64, pool_method: &str) {
     // Manual JSON output keeps the CLI lightweight without pulling in serde_json.
     print!("{{\n  \"frames\": [\n");
     for (i, fs) in ctx.per_frame_scores().iter().enumerate() {
@@ -628,8 +644,6 @@ fn main() -> Result<(), MainError> {
 
     let json = std::fs::read_to_string(&args.model)?;
     let model = load_model(&json)?;
-    let pool_method = parse_pool_method(&args.pool_method)?;
-
     let ref_file = std::fs::File::open(&args.reference)?;
     let dis_file = std::fs::File::open(&args.distorted)?;
 
@@ -638,7 +652,7 @@ fn main() -> Result<(), MainError> {
 
     let ref_meta = read_stream_metadata("reference", &ref_dec)?;
     let dis_meta = read_stream_metadata("distorted", &dis_dec)?;
-    validate_stream_metadata(&ref_meta, &dis_meta)?;
+    let geometry = validate_stream_metadata(&ref_meta, &dis_meta)?;
 
     if args.threads > 0 {
         rayon::ThreadPoolBuilder::new()
@@ -648,13 +662,11 @@ fn main() -> Result<(), MainError> {
 
     let mut ctx = VmafContext::new_with_options(
         model,
-        ref_meta.width,
-        ref_meta.height,
-        ref_meta.bit_depth,
+        geometry,
         VmafOptions {
             apply_score_transform: args.apply_score_transform,
         },
-    )?;
+    );
 
     let pb = if args.quiet {
         ProgressBar::hidden()
@@ -667,7 +679,7 @@ fn main() -> Result<(), MainError> {
     } else {
         rayon::current_num_threads()
     };
-    let batch_size = compute_batch_size(ref_meta.width, ref_meta.height, worker_count);
+    let batch_size = compute_batch_size(geometry.width(), geometry.height(), worker_count);
     let start = Instant::now();
     let mut io_timings = IoTimings::default();
     let mut processing_timings = ProcessingTimings::default();
@@ -700,7 +712,7 @@ fn main() -> Result<(), MainError> {
         process_stream_frames_with_timings(
             &mut ref_dec,
             &mut dis_dec,
-            ref_meta.bit_depth,
+            geometry.bpc(),
             batch_size,
             Some(&mut io_timings),
             &mut handle_batch,
@@ -709,7 +721,7 @@ fn main() -> Result<(), MainError> {
         process_stream_frames(
             &mut ref_dec,
             &mut dis_dec,
-            ref_meta.bit_depth,
+            geometry.bpc(),
             batch_size,
             &mut handle_batch,
         )
@@ -721,7 +733,7 @@ fn main() -> Result<(), MainError> {
     }
 
     let flush_start = Instant::now();
-    ctx.flush()?;
+    let ctx = ctx.flush();
     let flush_time = if hotspot_profile {
         flush_start.elapsed()
     } else {
@@ -730,7 +742,7 @@ fn main() -> Result<(), MainError> {
     pb.finish();
 
     let pool_start = Instant::now();
-    let pooled = ctx.pool_score(pool_method, args.n_subsample);
+    let pooled = ctx.pool_score(args.pool_method, args.n_subsample);
     let pool_time = if hotspot_profile {
         pool_start.elapsed()
     } else {
@@ -750,7 +762,7 @@ fn main() -> Result<(), MainError> {
     }
 
     if args.json {
-        emit_full_json(&ctx, pooled, &args.pool_method);
+        emit_full_json(&ctx, pooled, pool_method_label(args.pool_method));
     } else {
         println!("{}: {:.6}", args.model.display(), pooled);
     }
@@ -829,24 +841,6 @@ mod tests {
         y4m::Decoder::new(Cursor::new(bytes)).expect("Y4M stream should decode")
     }
 
-    fn test_metadata(
-        stream: &'static str,
-        width: usize,
-        height: usize,
-        bit_depth: u8,
-        colorspace: &str,
-        colorspace_family: ColorspaceFamily,
-    ) -> StreamMetadata {
-        StreamMetadata {
-            stream,
-            width,
-            height,
-            bit_depth,
-            colorspace: colorspace.to_string(),
-            colorspace_family,
-        }
-    }
-
     #[test]
     fn cli_defaults() {
         let args = parse_args(&[]);
@@ -892,10 +886,7 @@ mod tests {
 
     #[test]
     fn validate_stream_metadata_rejects_small_dimensions() {
-        let reference = test_metadata("reference", 15, 16, 8, "C420", ColorspaceFamily::Cs420);
-        let distorted = test_metadata("distorted", 15, 16, 8, "C420", ColorspaceFamily::Cs420);
-
-        let err = validate_stream_metadata(&reference, &distorted).unwrap_err();
+        let err = stream_geometry("reference", 15, 16, 8, "C420").unwrap_err();
         assert_eq!(
             err.to_string(),
             "reference stream dimensions must be at least 16x16, got 15x16"
@@ -904,10 +895,7 @@ mod tests {
 
     #[test]
     fn validate_stream_metadata_rejects_invalid_bit_depth() {
-        let reference = test_metadata("reference", 16, 16, 9, "C420p9", ColorspaceFamily::Cs420);
-        let distorted = test_metadata("distorted", 16, 16, 9, "C420p9", ColorspaceFamily::Cs420);
-
-        let err = validate_stream_metadata(&reference, &distorted).unwrap_err();
+        let err = stream_geometry("reference", 16, 16, 9, "C420p9").unwrap_err();
         assert_eq!(
             err.to_string(),
             "reference stream bit depth must be 8, 10, or 12, got 9 (C420p9)"

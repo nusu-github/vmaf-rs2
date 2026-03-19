@@ -13,11 +13,12 @@ mod score;
 mod simd;
 mod tables;
 
-pub use extractor::{AdmError, AdmExtractor, AdmWorkspace};
+pub use extractor::{AdmExtractor, AdmWorkspace};
+pub use vmaf_cpu::{FrameGeometry, GainLimit};
 
 #[cfg(test)]
 mod tests {
-    use vmaf_cpu::SimdBackend;
+    use vmaf_cpu::{FrameGeometry, GainLimit, SimdBackend};
 
     use super::{
         decouple::decouple_scale0,
@@ -30,6 +31,14 @@ mod tests {
         simd,
         tables::DIV_LOOKUP,
     };
+
+    fn geometry(width: usize, height: usize, bpc: u8) -> FrameGeometry {
+        FrameGeometry::new(width, height, bpc).unwrap()
+    }
+
+    fn gain_limit(value: f64) -> GainLimit {
+        GainLimit::new(value).unwrap()
+    }
 
     // ── div_lookup §8 conformance ─────────────────────────────────────────────
 
@@ -314,11 +323,16 @@ mod tests {
             *value = value.saturating_sub(delta / 2).min(max_value);
         }
 
-        let scalar =
-            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, SimdBackend::Scalar)
-                .unwrap();
-        let simd_backend =
-            AdmExtractor::with_backend_for_tests(width, height, bpc, 100.0, requested).unwrap();
+        let scalar = AdmExtractor::with_backend_for_tests(
+            geometry(width, height, bpc),
+            gain_limit(100.0),
+            SimdBackend::Scalar,
+        );
+        let simd_backend = AdmExtractor::with_backend_for_tests(
+            geometry(width, height, bpc),
+            gain_limit(100.0),
+            requested,
+        );
 
         assert_eq!(
             simd_backend.compute_frame(&ref_plane, &dis_plane).to_bits(),

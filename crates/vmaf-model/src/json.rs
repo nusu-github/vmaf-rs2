@@ -2,6 +2,7 @@
 
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use vmaf_cpu::{GainLimit, GainLimitError};
 
 use crate::{
     error::{LoadModelError, ModelValidationError},
@@ -129,7 +130,11 @@ fn json_type_name(v: &Value) -> &'static str {
     }
 }
 
-fn parse_gain_limit(v: &Value, key: &'static str, idx: usize) -> Result<f64, ModelValidationError> {
+fn parse_gain_limit(
+    v: &Value,
+    key: &'static str,
+    idx: usize,
+) -> Result<GainLimit, ModelValidationError> {
     let n = match v {
         Value::Number(num) => num
             .as_f64()
@@ -143,13 +148,10 @@ fn parse_gain_limit(v: &Value, key: &'static str, idx: usize) -> Result<f64, Mod
         }
     };
 
-    if !n.is_finite() {
-        return Err(ModelValidationError::GainLimitNonFinite { idx, key });
-    }
-    if n < 1.0 {
-        return Err(ModelValidationError::GainLimitTooSmall { idx, key });
-    }
-    Ok(n)
+    GainLimit::new(n).map_err(|err| match err {
+        GainLimitError::NonFinite { .. } => ModelValidationError::GainLimitNonFinite { idx, key },
+        GainLimitError::TooSmall { .. } => ModelValidationError::GainLimitTooSmall { idx, key },
+    })
 }
 
 fn validate_score_clip(score_clip: [f64; 2]) -> Result<(), ModelValidationError> {
@@ -226,8 +228,8 @@ pub fn load_model(json: &str) -> Result<VmafModel, LoadModelError> {
         .map_err(|names: Vec<String>| ModelValidationError::FeatureNamesLen { len: names.len() })?;
     validate_feature_names(&feature_names)?;
 
-    let mut adm_enhn_gain_limit = 100.0f64;
-    let mut vif_enhn_gain_limit = 100.0f64;
+    let mut adm_enhn_gain_limit = GainLimit::new(100.0).expect("default gain limit is valid");
+    let mut vif_enhn_gain_limit = GainLimit::new(100.0).expect("default gain limit is valid");
 
     if let Some(feature_opts_dicts) = d.feature_opts_dicts.as_ref() {
         if feature_opts_dicts.len() != 6 {
@@ -260,7 +262,7 @@ pub fn load_model(json: &str) -> Result<VmafModel, LoadModelError> {
         }
 
         // VIF scales (feature indices 2..=5)
-        let mut vif_vals: [Option<f64>; 4] = [None, None, None, None];
+        let mut vif_vals: [Option<GainLimit>; 4] = [None, None, None, None];
         for s in 0..4usize {
             if let Some(v) = feature_opts_dicts[2 + s].get("vif_enhn_gain_limit") {
                 vif_vals[s] = Some(parse_gain_limit(v, "vif_enhn_gain_limit", 2 + s)?);
@@ -409,16 +411,16 @@ mod tests {
     #[test]
     fn load_model_defaults_gain_limits() {
         let m = load_model(MINIMAL_JSON).unwrap();
-        assert_eq!(m.adm_enhn_gain_limit, 100.0);
-        assert_eq!(m.vif_enhn_gain_limit, 100.0);
+        assert_eq!(m.adm_enhn_gain_limit.value(), 100.0);
+        assert_eq!(m.vif_enhn_gain_limit.value(), 100.0);
     }
 
     #[test]
     fn load_model_parses_neg_model_feature_opts() {
         let json = include_str!("../../../models/vmaf_v0.6.1neg.json");
         let m = load_model(json).unwrap();
-        assert_eq!(m.adm_enhn_gain_limit, 1.0);
-        assert_eq!(m.vif_enhn_gain_limit, 1.0);
+        assert_eq!(m.adm_enhn_gain_limit.value(), 1.0);
+        assert_eq!(m.vif_enhn_gain_limit.value(), 1.0);
     }
 
     #[test]

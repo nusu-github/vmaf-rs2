@@ -17,3 +17,4 @@ pub use normalize::normalize_features;
 pub use pool::{PoolMethod, collect_scores, pool};
 pub use predict::{denormalize, score_transform};
 pub use svm::svm_predict;
+pub use vmaf_cpu::{GainLimit, GainLimitError};

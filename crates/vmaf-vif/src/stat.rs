@@ -1,7 +1,7 @@
 //! VIF statistic core — spec §4.2.6–4.2.8
 
 use aligned_vec::AVec;
-use vmaf_cpu::{ConstAlign32, SimdBackend, avec_zeroed_32};
+use vmaf_cpu::{ConstAlign32, GainLimit, SimdBackend, avec_zeroed_32};
 
 use crate::{
     math::{log2_32, log2_64, reflect_index},
@@ -38,6 +38,11 @@ impl VifGainLimitMode {
         } else {
             Self::Generic(limit)
         }
+    }
+
+    #[inline]
+    pub(crate) fn from_gain_limit(limit: GainLimit) -> Self {
+        Self::new(limit.value())
     }
 }
 
